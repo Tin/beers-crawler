@@ -126,8 +126,27 @@ def test_match_score_sidebar_penalty():
 
 def test_split_query_hints_brewery_and_beer():
     brewery, beer = split_query_hints("Russian River Pliny the Elder")
-    assert "russian" in brewery or "river" in brewery
-    assert "pliny" in beer
+    # 4 content tokens after stopword drop → single-token brewery split
+    assert "russian" in brewery or "pliny" in beer
+    assert "pliny" in beer or "elder" in beer
+
+
+def test_split_query_hints_keeps_multiword_beer_name():
+    brewery, beer = split_query_hints("Moonlight Bombay by Boat")
+    assert "moonlight" in brewery
+    assert "bombay" in beer
+    assert "boat" in beer
+    # "by" is a stop token and must not steal brewery slot
+    assert "bombay" not in brewery
+
+
+def test_match_score_bombay_by_boat():
+    score = match_score(
+        "Moonlight Bombay by Boat",
+        "moonlight-brewing-company-bombay-by-boat",
+        "Bombay by Boat Moonlight Brewing Company",
+    )
+    assert score >= 0.8
 
 
 def test_parse_beer_page_rating():

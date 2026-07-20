@@ -57,6 +57,10 @@ STOP_TOKENS = frozenset(
         "co",
         "inc",
         "llc",
+        "by",  # "Bombay by Boat" — keep boat/bombay distinctive
+        "of",
+        "for",
+        "with",
     }
 )
 
@@ -82,9 +86,11 @@ def _normalized_phrase(text: str) -> str:
 def split_query_hints(query: str) -> tuple[set[str], set[str]]:
     """Heuristic split of free-text query into brewery-ish vs beer-name tokens.
 
-    Untappd queries are usually ``\"Brewery Beer Name\"``. First 1–3 tokens that
-    look like a brewery prefix are treated as brewery; the rest as beer name.
-    If the query is short, all content tokens are beer-name tokens.
+    Untappd queries are usually ``\"Brewery Beer Name\"``. Prefer a **single**
+    leading token as brewery for short queries so multi-word beer names keep
+    distinctive tokens (e.g. ``Moonlight Bombay by Boat`` → brewery={moonlight},
+    beer={bombay, boat}). Longer classic forms like ``Russian River Pliny the
+    Elder`` still treat the first two content tokens as brewery when ≥5 tokens.
     """
     raw = [t for t in re.split(r"[^a-z0-9]+", query.lower()) if t]
     content = [t for t in raw if t not in STOP_TOKENS and len(t) >= 2]
@@ -95,21 +101,19 @@ def split_query_hints(query: str) -> tuple[set[str], set[str]]:
     if len(content) <= 2:
         return set(), set(content)
 
-    # Prefer first token(s) as brewery when query is longer
-    # e.g. "russian river pliny the elder" → brewery={russian,river}, beer={pliny,elder}
-    brewery: set[str] = set()
-    beer: set[str] = set()
-    # Take leading run up to 3 content tokens as brewery candidate, rest as beer —
-    # but require beer side to keep at least one distinctive token.
-    if len(content) >= 4:
+    # ≥5 content tokens: likely "Two Word Brewery + beer…"
+    # e.g. russian river pliny the elder → content without stop: russian,river,pliny,elder (4)
+    # with elder+extra style words can be 5+. Use 2-token brewery only when enough left.
+    if len(content) >= 5:
         brewery = set(content[:2])
         beer = set(content[2:])
     else:
+        # 3–4 tokens: first token brewery, rest beer name
+        # Moonlight Bombay Boat → brewery={moonlight}, beer={bombay,boat}
         brewery = {content[0]}
         beer = set(content[1:])
 
-    # Drop stop-ish leftovers from beer side already filtered
-    beer = {t for t in beer if t not in STOP_TOKENS} or set(content[len(content) // 2 :])
+    beer = {t for t in beer if t not in STOP_TOKENS} or set(content[1:])
     return brewery, beer
 
 

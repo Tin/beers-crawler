@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
-from typing import Optional
+import re
+import time
+from typing import Any, Optional
 from urllib.parse import quote_plus
 
 import httpx
 
 from beers_crawler.models import BeerMetadata, BeerPageRef
 from beers_crawler.untappd.parsers import (
+    match_score,
     normalize_beer_url,
     parse_beer_page,
     parse_search_results,
@@ -37,7 +41,15 @@ def pick_best_candidate(
     if top.match_score < min_score:
         return None
 
-    if not list_hits and top.source in {
+    # Prefer Algolia / primary list over sidebar junk when mixed
+    algolia_hits = [c for c in candidates if c.source == "untappd_algolia"]
+    if algolia_hits and not list_hits:
+        pool = algolia_hits
+        top = pool[0]
+        if top.match_score < min_score:
+            return None
+
+    if not list_hits and not algolia_hits and top.source in {
         "untappd_search",
         "untappd_search_sidebar",
         "untappd_search_raw",
@@ -104,6 +116,8 @@ class UntappdClient:
         self._context = None
         self._last_candidates: list[BeerPageRef] = []
         self._playwright_failed = False
+        self._algolia_cfg: Optional[dict[str, str]] = None
+        self._algolia_cfg_at: float = 0.0
 
     @property
     def last_candidates(self) -> list[BeerPageRef]:
@@ -286,12 +300,132 @@ class UntappdClient:
         assert last_err is not None
         raise last_err
 
-    async def _resolve_via_external_search(self, query: str) -> list[BeerPageRef]:
-        """Lightweight resolve when Untappd search HTML is JS-only (no Playwright).
+    async def _fetch_untappd_search_config(self) -> Optional[dict[str, str]]:
+        """Public Algolia search keys embedded in Untappd search page HTML."""
+        now = time.time()
+        if self._algolia_cfg and now - self._algolia_cfg_at < 3600:
+            return self._algolia_cfg
+        html = await self._get_html_httpx(
+            "https://untappd.com/search?q=beer&type=beer"
+        )
+        if not html:
+            return self._algolia_cfg
+        m = re.search(
+            r"window\.UNTAPPD_SEARCH_CONFIG\s*=\s*(\{.*?\})\s*;",
+            html,
+            re.S,
+        )
+        if not m:
+            logger.warning("UNTAPPD_SEARCH_CONFIG not found in search HTML")
+            return self._algolia_cfg
+        try:
+            cfg = json.loads(m.group(1))
+        except json.JSONDecodeError:
+            logger.warning("failed to parse UNTAPPD_SEARCH_CONFIG")
+            return self._algolia_cfg
+        app_id = cfg.get("appId") or cfg.get("autocompleteAppId")
+        api_key = cfg.get("searchKey") or cfg.get("autocompleteSearchKey")
+        indexes = cfg.get("indexes") or {}
+        beer_idx = "beer"
+        if isinstance(indexes.get("beer"), dict):
+            beer_idx = indexes["beer"].get("all") or beer_idx
+        elif isinstance(indexes.get("beer"), str):
+            beer_idx = indexes["beer"]
+        if not app_id or not api_key:
+            return self._algolia_cfg
+        self._algolia_cfg = {
+            "app_id": str(app_id),
+            "api_key": str(api_key),
+            "index": str(beer_idx),
+        }
+        self._algolia_cfg_at = now
+        logger.info(
+            "Untappd Algolia config loaded app_id=%s index=%s",
+            app_id,
+            beer_idx,
+        )
+        return self._algolia_cfg
 
-        Prefer Brave (often works from VPS); fall back to DuckDuckGo HTML
-        (frequently returns HTTP 202/challenge under rate limit).
+    async def _resolve_via_algolia(self, query: str) -> list[BeerPageRef]:
+        """Query Untappd's public Algolia beer index (same backend as site search UI).
+
+        Works without Playwright and without third-party search engines.
         """
+        cfg = await self._fetch_untappd_search_config()
+        if not cfg:
+            return []
+        app_id = cfg["app_id"]
+        api_key = cfg["api_key"]
+        index = cfg["index"]
+        url = f"https://{app_id}-dsn.algolia.net/1/indexes/{index}/query"
+        headers = {
+            "X-Algolia-Application-Id": app_id,
+            "X-Algolia-API-Key": api_key,
+            "Content-Type": "application/json",
+            "User-Agent": USER_AGENT,
+            "Accept": "application/json",
+        }
+        payload: dict[str, Any] = {"query": query, "hitsPerPage": 20}
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout_ms / 1000.0) as client:
+                resp = await client.post(url, headers=headers, json=payload)
+                if resp.status_code == 429:
+                    logger.warning("Algolia 429 for query %r", query)
+                    return []
+                resp.raise_for_status()
+                data = resp.json()
+        except Exception as exc:
+            logger.warning("Algolia search failed for %r: %s", query, exc)
+            return []
+
+        results: list[BeerPageRef] = []
+        seen: set[str] = set()
+        for hit in data.get("hits") or []:
+            if not isinstance(hit, dict):
+                continue
+            bid = hit.get("bid") or hit.get("objectID")
+            slug = hit.get("beer_slug")
+            if not bid:
+                continue
+            if not slug:
+                # Fallback from beer_index text
+                idx = str(hit.get("beer_index") or hit.get("beer_name") or "")
+                slug = re.sub(r"[^a-z0-9]+", "-", idx.lower()).strip("-") or "beer"
+            page_url = f"https://untappd.com/b/{slug}/{bid}"
+            if page_url in seen:
+                continue
+            seen.add(page_url)
+            link_text = " ".join(
+                str(x)
+                for x in (
+                    hit.get("beer_name"),
+                    hit.get("brewery_name"),
+                    hit.get("beer_index"),
+                )
+                if x
+            )
+            score = match_score(query, str(slug), link_text, in_primary_list=True)
+            results.append(
+                BeerPageRef(
+                    query=query,
+                    page_url=page_url,
+                    slug=str(slug),
+                    beer_id=str(bid),
+                    match_score=score,
+                    source="untappd_algolia",
+                )
+            )
+        results.sort(key=lambda r: r.match_score, reverse=True)
+        logger.info(
+            "Algolia found %d candidates for %r (top=%s)",
+            len(results),
+            query,
+            f"{results[0].match_score:.2f}" if results else "n/a",
+        )
+        return results
+
+    async def _resolve_via_external_search(self, query: str) -> list[BeerPageRef]:
+        """Third-party HTML search when Algolia is unavailable."""
         q = quote_plus(f"site:untappd.com/b {query}")
         engines = (
             ("brave", f"https://search.brave.com/search?q={q}"),
@@ -326,16 +460,27 @@ class UntappdClient:
         self._last_candidates = []
         if not query:
             return []
-        search_url = f"https://untappd.com/search?q={quote_plus(query)}&type=beer"
-        logger.info("searching Untappd for %r → %s", query, search_url)
-        html = await self._get_html(search_url, wait_selector="a[href*='/b/']")
-        results = parse_search_results(html, query)
-        # If Untappd static HTML only had sidebar junk, try DuckDuckGo
+
+        # 1) Untappd Algolia (real search backend; works on small VPS)
+        results = await self._resolve_via_algolia(query)
         best = pick_best_candidate(results, query, self.min_match_score)
+
+        # 2) Static Untappd HTML / Playwright if Algolia missed
+        if best is None:
+            search_url = f"https://untappd.com/search?q={quote_plus(query)}&type=beer"
+            logger.info("searching Untappd HTML for %r → %s", query, search_url)
+            html = await self._get_html(search_url, wait_selector="a[href*='/b/']")
+            html_results = parse_search_results(html, query)
+            if html_results:
+                results = html_results
+                best = pick_best_candidate(results, query, self.min_match_score)
+
+        # 3) Third-party search engines last
         if best is None:
             external = await self._resolve_via_external_search(query)
             if external:
                 results = external
+
         self._last_candidates = results
         logger.info("found %d candidates for %r", len(results), query)
         return results
