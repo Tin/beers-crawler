@@ -1,30 +1,109 @@
 <script setup>
 import { computed, onMounted, ref, watch } from 'vue'
-import { crawlBeer, fetchMetadata, health, resolveBeerName } from './api.js'
+import {
+  clearStoredCredentials,
+  crawlBeer,
+  fetchMetadata,
+  getStoredCredentials,
+  health,
+  healthDetail,
+  login,
+  logout,
+  resolveBeerName,
+} from './api.js'
 
 const beerName = ref('Russian River Pliny the Elder')
 const pageUrl = ref('')
 const force = ref(false)
 const historyOnly = ref(false)
 
-const busy = ref(null) // 'resolve' | 'metadata' | 'both' | null
+const busy = ref(null) // 'resolve' | 'metadata' | 'both' | 'login' | null
 const error = ref('')
 const pageRef = ref(null)
 const metadata = ref(null)
 const apiHealth = ref(null)
+const authRequired = ref(true)
+const authed = ref(false)
+const authUser = ref('')
+const loginUser = ref('')
+const loginPass = ref('')
+const loginError = ref('')
 
 const options = computed(() => ({
   force: force.value,
   historyOnly: historyOnly.value,
 }))
 
-onMounted(async () => {
+async function refreshHealth() {
   try {
-    apiHealth.value = await health()
+    const h = await health()
+    apiHealth.value = h
+    authRequired.value = h.auth_required !== false
   } catch {
     apiHealth.value = null
   }
+}
+
+async function tryExistingSession() {
+  const creds = getStoredCredentials()
+  if (!creds) {
+    authed.value = !authRequired.value
+    return
+  }
+  try {
+    const detail = await healthDetail()
+    apiHealth.value = detail
+    authed.value = true
+    authUser.value = creds.username
+  } catch (e) {
+    if (e.status === 401) {
+      clearStoredCredentials()
+      authed.value = false
+      authUser.value = ''
+    }
+  }
+}
+
+onMounted(async () => {
+  await refreshHealth()
+  if (authRequired.value) {
+    await tryExistingSession()
+  } else {
+    authed.value = true
+  }
 })
+
+async function submitLogin() {
+  loginError.value = ''
+  const u = loginUser.value.trim()
+  const p = loginPass.value
+  if (!u || !p) {
+    loginError.value = 'Enter username and password.'
+    return
+  }
+  busy.value = 'login'
+  try {
+    const detail = await login(u, p)
+    apiHealth.value = detail
+    authed.value = true
+    authUser.value = u
+    loginPass.value = ''
+  } catch (e) {
+    authed.value = false
+    loginError.value = e.status === 401 ? 'Invalid username or password.' : e.message || String(e)
+  } finally {
+    busy.value = null
+  }
+}
+
+function doLogout() {
+  logout()
+  authed.value = !authRequired.value
+  authUser.value = ''
+  pageRef.value = null
+  metadata.value = null
+  error.value = ''
+}
 
 watch(pageRef, (ref) => {
   if (ref?.page_url && !pageUrl.value) {
@@ -92,18 +171,24 @@ async function runBoth() {
     metadata.value = crawled.metadata
     if (crawled.page?.page_url) pageUrl.value = crawled.page.page_url
   } catch (e) {
-    // Fallback: call the two endpoints separately
-    try {
-      pageRef.value = await resolveBeerName(q, options.value)
-      pageUrl.value = pageRef.value.page_url
-      metadata.value = await fetchMetadata(pageRef.value.page_url, options.value)
-    } catch (e2) {
-      error.value = e2.message || e.message || String(e2)
+    if (e.status === 401) {
+      error.value = 'Session expired — sign in again.'
+      doLogout()
+    } else {
+      try {
+        pageRef.value = await resolveBeerName(q, options.value)
+        pageUrl.value = pageRef.value.page_url
+        metadata.value = await fetchMetadata(pageRef.value.page_url, options.value)
+      } catch (e2) {
+        error.value = e2.message || e.message || String(e2)
+        if (e2.status === 401) doLogout()
+      }
     }
   } finally {
     busy.value = null
     try {
-      apiHealth.value = await health()
+      if (authed.value) apiHealth.value = await healthDetail()
+      else await refreshHealth()
     } catch {
       /* ignore */
     }
@@ -154,18 +239,55 @@ const ratingPercent = computed(() => {
         <span class="dot" />
         <template v-if="apiHealth">
           API {{ apiHealth.status }}
-          <span class="sep">·</span>
-          {{ apiHealth.stats?.with_rating_score ?? 0 }} scored
-          <span class="sep">·</span>
-          refresh {{ Math.round((apiHealth.min_refresh_seconds || 0) / 3600) }}h
+          <template v-if="apiHealth.auth_required">
+            <span class="sep">·</span>
+            auth
+          </template>
+          <template v-if="authed && apiHealth.stats">
+            <span class="sep">·</span>
+            {{ apiHealth.stats?.with_rating_score ?? 0 }} scored
+            <span class="sep">·</span>
+            refresh {{ Math.round((apiHealth.min_refresh_seconds || 0) / 3600) }}h
+          </template>
+          <template v-if="authUser">
+            <span class="sep">·</span>
+            {{ authUser }}
+          </template>
         </template>
         <template v-else>
           API offline — start <code>beers-crawler serve</code>
         </template>
       </div>
+      <button
+        v-if="authed && authRequired"
+        type="button"
+        class="ghost logout"
+        @click="doLogout"
+      >
+        Log out
+      </button>
     </header>
 
-    <main class="grid">
+    <section v-if="authRequired && !authed" class="panel login-panel">
+      <h2>Sign in</h2>
+      <p class="hint">This API requires a username and password.</p>
+      <form class="login-form" @submit.prevent="submitLogin">
+        <label class="field">
+          <span>Username</span>
+          <input v-model="loginUser" type="text" autocomplete="username" required />
+        </label>
+        <label class="field">
+          <span>Password</span>
+          <input v-model="loginPass" type="password" autocomplete="current-password" required />
+        </label>
+        <p v-if="loginError" class="error" role="alert">{{ loginError }}</p>
+        <button type="submit" class="primary" :disabled="busy === 'login'">
+          {{ busy === 'login' ? 'Signing in…' : 'Sign in' }}
+        </button>
+      </form>
+    </section>
+
+    <main v-else class="grid">
       <section class="panel">
         <h2>1 · Resolve</h2>
         <p class="hint">Beer name → Untappd page URL</p>
@@ -331,6 +453,20 @@ const ratingPercent = computed(() => {
   justify-content: space-between;
   gap: 1rem;
   margin-bottom: 1.75rem;
+}
+
+.logout {
+  margin-left: auto;
+}
+
+.login-panel {
+  max-width: 420px;
+  margin: 0 auto 2rem;
+}
+
+.login-form .primary {
+  width: 100%;
+  margin-top: 0.5rem;
 }
 
 .brand {

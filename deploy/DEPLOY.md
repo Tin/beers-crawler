@@ -54,13 +54,15 @@ Requires `deploy/deploy.env` (or the same variables exported in the environment)
 What it does:
 
 1. `npm run build` with `base=/beers/rating/` and `VITE_API_BASE=/beers/rating/api`
-2. Creates remote dirs; **seeds `env` only if missing**
+2. Creates remote dirs; **seeds `env` only if missing** (never overwrites users/DB)
 3. rsync code → `app/` (deletes stale code files, not data)
 4. rsync `web/dist/`
 5. `uv sync` on server
 6. Installs/restarts `beers-crawler.service` (uvicorn `127.0.0.1:8741`)
 7. Installs nginx snippet + reloads nginx (unless `--no-nginx`)
-8. Smoke-tests local health (+ optional public URL if `DEPLOY_PUBLIC_BASE` set)
+8. Smoke-tests local `/health` (+ optional public URL if `DEPLOY_PUBLIC_BASE` set)
+
+After first deploy, create at least one API user (see below) or the API will refuse to start.
 
 Useful flags:
 
@@ -107,6 +109,25 @@ BEERS_CRAWLER_ALLOW_PLAYWRIGHT=0
 BEERS_CRAWLER_MIN_REFRESH_SECONDS=21600
 # BEERS_CRAWLER_CORS=https://www.example.com
 ```
+
+### API users (required)
+
+HTTP Basic auth is **on** by default. Users live in SQLite (`api_users`) as **password hashes only**.
+
+```bash
+# on server, from $DEPLOY_ROOT/app with the service env loaded:
+cd $DEPLOY_ROOT/app
+set -a && source $DEPLOY_ROOT/env && set +a
+uv run beers-crawler user add <username>          # prompts for password
+uv run beers-crawler user passwd <username>       # change password
+uv run beers-crawler user list
+uv run beers-crawler user delete <username>
+sudo systemctl restart beers-crawler
+```
+
+Never put real usernames/passwords in git. Optional env bootstrap:
+`BEERS_CRAWLER_API_USER` + `BEERS_CRAWLER_API_PASSWORD` (prefer CLI users).
+Local open mode only: `BEERS_CRAWLER_AUTH_DISABLED=1`.
 
 On small VPS hosts, production typically uses:
 

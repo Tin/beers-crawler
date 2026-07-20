@@ -124,7 +124,14 @@ cd web && npm install && npm run dev
 # Deploy API + UI (preserves remote SQLite history)
 cp deploy/deploy.env.example deploy/deploy.env   # once
 ./scripts/deploy.sh
+
+# API users (password hashed in SQLite — never commit passwords)
+uv run beers-crawler user add <username>
+uv run beers-crawler user passwd <username>
+uv run beers-crawler user list
 ```
+
+HTTP Basic auth is required unless `BEERS_CRAWLER_AUTH_DISABLED=1` (local only).
 
 ### Toronado Viscosity
 

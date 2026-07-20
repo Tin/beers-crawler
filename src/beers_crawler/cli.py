@@ -431,10 +431,125 @@ def history_cmd(page_url: str, db_path: Optional[Path], limit: int, as_json: boo
 @main.command("init-db")
 @_db_option
 def init_db_cmd(db_path: Optional[Path]) -> None:
-    """Create SQLite schema."""
+    """Create SQLite schema (including api_users)."""
+    from beers_crawler.auth import UserStore
+
     db = BeerDatabase(db_path)
+    store = UserStore(db.path)
     console.print(f"Initialized {db.path}")
     console.print(db.stats())
+    console.print(f"api_users: {store.count()}")
+
+
+@main.group("user")
+def user_group() -> None:
+    """Manage API users (HTTP Basic auth). Passwords are hashed; never stored plain."""
+
+
+@user_group.command("add")
+@click.argument("username")
+@_db_option
+@click.option(
+    "--password",
+    "password_opt",
+    default=None,
+    help="Password (prefer omit to be prompted securely)",
+)
+def user_add_cmd(
+    username: str, db_path: Optional[Path], password_opt: Optional[str]
+) -> None:
+    """Create a new API user."""
+    from beers_crawler.auth import MIN_PASSWORD_LEN, UserStore
+
+    db = BeerDatabase(db_path)
+    store = UserStore(db.path)
+    password = password_opt
+    if not password:
+        password = click.prompt("Password", hide_input=True, confirmation_prompt=True)
+    try:
+        store.add_user(username, password)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise SystemExit(1) from exc
+    console.print(
+        f"[green]Created user[/green] {username!r} in {store.path} "
+        f"(min password length {MIN_PASSWORD_LEN})"
+    )
+
+
+@user_group.command("passwd")
+@click.argument("username")
+@_db_option
+@click.option(
+    "--password",
+    "password_opt",
+    default=None,
+    help="New password (prefer omit to be prompted securely)",
+)
+def user_passwd_cmd(
+    username: str, db_path: Optional[Path], password_opt: Optional[str]
+) -> None:
+    """Change an existing user's password."""
+    from beers_crawler.auth import UserStore
+
+    db = BeerDatabase(db_path)
+    store = UserStore(db.path)
+    password = password_opt
+    if not password:
+        password = click.prompt(
+            "New password", hide_input=True, confirmation_prompt=True
+        )
+    try:
+        store.set_password(username, password)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise SystemExit(1) from exc
+    console.print(f"[green]Updated password for[/green] {username!r}")
+
+
+@user_group.command("list")
+@_db_option
+def user_list_cmd(db_path: Optional[Path]) -> None:
+    """List API usernames (no password data)."""
+    from beers_crawler.auth import UserStore
+
+    db = BeerDatabase(db_path)
+    store = UserStore(db.path)
+    names = store.list_usernames()
+    if not names:
+        console.print(
+            f"[yellow]No API users in[/yellow] {store.path}\n"
+            "Create one:  beers-crawler user add <username>"
+        )
+        return
+    table = Table(title=f"API users ({store.path})")
+    table.add_column("#", justify="right")
+    table.add_column("Username")
+    for i, name in enumerate(names, 1):
+        table.add_row(str(i), name)
+    console.print(table)
+
+
+@user_group.command("delete")
+@click.argument("username")
+@_db_option
+@click.option("--yes", is_flag=True, help="Skip confirmation")
+def user_delete_cmd(
+    username: str, db_path: Optional[Path], yes: bool
+) -> None:
+    """Delete an API user."""
+    from beers_crawler.auth import UserStore
+
+    db = BeerDatabase(db_path)
+    store = UserStore(db.path)
+    if not yes and not click.confirm(f"Delete user {username!r}?"):
+        raise SystemExit(1)
+    try:
+        store.delete_user(username)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise SystemExit(1) from exc
+    console.print(f"[green]Deleted user[/green] {username!r}")
 
 
 @main.command("stats")

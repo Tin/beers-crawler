@@ -47,6 +47,14 @@ CREATE INDEX IF NOT EXISTS idx_beer_metadata_url_time
 CREATE INDEX IF NOT EXISTS idx_beer_metadata_name ON beer_metadata(name);
 CREATE INDEX IF NOT EXISTS idx_beer_metadata_score ON beer_metadata(rating_score);
 CREATE INDEX IF NOT EXISTS idx_beer_metadata_scraped ON beer_metadata(scraped_at DESC);
+
+-- API users: password hashes only (never plaintext). Managed via CLI ``user`` commands.
+CREATE TABLE IF NOT EXISTS api_users (
+    username TEXT PRIMARY KEY COLLATE NOCASE,
+    password_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 
@@ -84,6 +92,17 @@ class BeerDatabase:
         with self._connect() as conn:
             conn.executescript(SCHEMA)
             self._migrate_metadata_unique(conn)
+            # Ensure users table exists even on DBs created before auth
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS api_users (
+                    username TEXT PRIMARY KEY COLLATE NOCASE,
+                    password_hash TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                """
+            )
 
     def _migrate_metadata_unique(self, conn: sqlite3.Connection) -> None:
         """Drop legacy UNIQUE(page_url) so each crawl can append a history row."""
