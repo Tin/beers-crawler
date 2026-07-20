@@ -11,6 +11,7 @@ from urllib.parse import quote_plus
 import httpx
 
 from beers_crawler.models import BeerMetadata, BeerPageRef
+from beers_crawler.llm import guess_search_keywords, llm_enabled
 from beers_crawler.untappd.parsers import (
     match_score,
     normalize_beer_url,
@@ -401,13 +402,16 @@ class UntappdClient:
             if page_url in seen:
                 continue
             seen.add(page_url)
+            # Lead with beer_name so exact-title ranking can see it clearly.
+            beer_name = str(hit.get("beer_name") or "")
+            brewery_name = str(hit.get("brewery_name") or "")
             link_text = " ".join(
-                str(x)
+                x
                 for x in (
-                    hit.get("beer_name"),
-                    hit.get("brewery_name"),
-                    hit.get("beer_index"),
-                    hit.get("type_name"),
+                    beer_name,
+                    brewery_name,
+                    str(hit.get("beer_index") or ""),
+                    str(hit.get("type_name") or ""),
                 )
                 if x
             )
@@ -415,18 +419,27 @@ class UntappdClient:
             score = match_score(
                 original_query, str(slug), link_text, in_primary_list=True
             )
+            # Slight preference for in-production base beers over aged variants when tied
+            if hit.get("in_production") in (0, "0", False):
+                score = max(0.0, score - 0.02)
+            # Prefer shorter beer titles when scores are close (base vs Vanilla/Double)
+            name_len = len(beer_name)
             results.append(
-                BeerPageRef(
-                    query=original_query,
-                    page_url=page_url,
-                    slug=str(slug),
-                    beer_id=str(bid),
-                    match_score=score,
-                    source="untappd_algolia",
+                (
+                    score,
+                    name_len,
+                    BeerPageRef(
+                        query=original_query,
+                        page_url=page_url,
+                        slug=str(slug),
+                        beer_id=str(bid),
+                        match_score=score,
+                        source="untappd_algolia",
+                    ),
                 )
             )
-        results.sort(key=lambda r: r.match_score, reverse=True)
-        return results
+        results.sort(key=lambda t: (-t[0], t[1]))
+        return [t[2] for t in results]
 
     async def _resolve_via_algolia(self, query: str) -> list[BeerPageRef]:
         """Query Untappd's public Algolia beer index (same backend as site search UI).
@@ -434,33 +447,62 @@ class UntappdClient:
         Strategy (mirrors Untappd app behavior):
           1. Search primarily by **beer name** (not "Brewery + Beer" as one string).
           2. Rank hits with our scorer so the correct **brewery** wins among namesakes.
-          3. Fall back to fuller query variants only if beer-name search is weak.
+          3. If still weak and LLM is configured, ask the model for better keywords
+             and search those (DeepSeek OpenAI-compatible API).
         """
         cfg = await self._fetch_untappd_search_config()
         if not cfg:
             return []
 
-        # Merge hits across variants; re-score against full original query (brewery+beer).
-        by_url: dict[str, BeerPageRef] = {}
-        for variant in search_query_variants(query):
-            hits = await self._algolia_query_once(
-                cfg=cfg, query=variant, original_query=query
+        async def _run_variants(variants: list[str]) -> list[BeerPageRef]:
+            by_url: dict[str, BeerPageRef] = {}
+            for variant in variants:
+                hits = await self._algolia_query_once(
+                    cfg=cfg, query=variant, original_query=query
+                )
+                logger.info(
+                    "Algolia beer-search %r → %d hits (top=%s)",
+                    variant,
+                    len(hits),
+                    f"{hits[0].match_score:.2f} {hits[0].page_url}"
+                    if hits
+                    else "n/a",
+                )
+                for h in hits:
+                    prev = by_url.get(h.page_url)
+                    if prev is None or h.match_score > prev.match_score:
+                        by_url[h.page_url] = h
+                if hits and hits[0].match_score >= 0.9:
+                    break
+            # Higher score first; on ties prefer shorter slug (base beer over variants)
+            return sorted(
+                by_url.values(),
+                key=lambda r: (-r.match_score, len(r.slug or r.page_url)),
             )
-            logger.info(
-                "Algolia beer-search %r → %d hits (top=%s)",
-                variant,
-                len(hits),
-                f"{hits[0].match_score:.2f} {hits[0].page_url}" if hits else "n/a",
-            )
-            for h in hits:
-                prev = by_url.get(h.page_url)
-                if prev is None or h.match_score > prev.match_score:
-                    by_url[h.page_url] = h
-            # Early exit: strong beer+brewery match already found
-            if hits and hits[0].match_score >= 0.9:
-                break
 
-        best = sorted(by_url.values(), key=lambda r: r.match_score, reverse=True)
+        # 1) Cheap heuristics only (no LLM tokens)
+        best = await _run_variants(search_query_variants(query))
+
+        # 2) LLM only if heuristics failed or scored below accept threshold.
+        #    Good heuristic hits never spend tokens.
+        heuristic_ok = bool(best) and best[0].match_score >= self.min_match_score
+        if llm_enabled() and not heuristic_ok:
+            logger.info(
+                "LLM keyword fallback for %r (heuristic top=%s)",
+                query,
+                f"{best[0].match_score:.2f}" if best else "none",
+            )
+            guess = await guess_search_keywords(query)
+            if guess and guess.search_queries:
+                llm_hits = await _run_variants(guess.search_queries)
+                if llm_hits and (
+                    not best or llm_hits[0].match_score > best[0].match_score
+                ):
+                    best = [
+                        h.model_copy(update={"source": "untappd_algolia_llm"})
+                        for h in llm_hits
+                    ]
+
         logger.info(
             "Algolia merged %d candidates for %r (top=%s)",
             len(best),

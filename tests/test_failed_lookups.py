@@ -70,6 +70,42 @@ def test_variants_drop_of_for_ivander():
     assert any("fieldwork" in v.lower() for v in vs)  # full query still a fallback
 
 
+def test_normalize_alvarado_st_and_ipa_acronyms():
+    from beers_crawler.untappd.parsers import normalize_menu_query, beer_name_search_string
+
+    assert "Street" in normalize_menu_query("Alvarado St. Haole Punch")
+    assert beer_name_search_string("Alvarado St. Haole Punch(s)") == "haole punch"
+    assert beer_name_search_string("Alvarado St. Mai Tai IPA") == "mai tai"
+    # IIPA / 3xIPA treated as styles to strip
+    assert "wandering don" == beer_name_search_string("Firestone Walker Wandering Don IIPA")
+    assert "faces of phases" == beer_name_search_string(
+        "Monkish Faces of Phases 3xIPA"
+    ) or beer_name_search_string("Monkish Faces of Phases 3xIPA") == "faces phases"
+
+
+def test_haole_punch_prefers_exact_title():
+    from beers_crawler.untappd.parsers import match_score
+
+    q = "Alvarado St. Haole Punch"
+    base = match_score(
+        q,
+        "alvarado-street-brewery-haole-punch-2020",
+        "Haole Punch (2020) Alvarado Street Brewery",
+    )
+    vanilla = match_score(
+        q,
+        "alvarado-street-brewery-haole-punch-vanilla",
+        "Haole Punch Vanilla Alvarado Street Brewery",
+    )
+    howzit = match_score(
+        q,
+        "alvarado-street-brewery-howzit-punch",
+        "Howzit Punch Alvarado Street Brewery",
+    )
+    assert base > vanilla
+    assert base > howzit
+
+
 def test_record_and_list_failures(tmp_path):
     db = BeerDatabase(tmp_path / "f.db")
     a = db.record_failed_lookup("Moonlight X", error="no_match")
@@ -132,3 +168,21 @@ def test_failures_api(monkeypatch, tmp_path):
 
         stats = client.get("/v1/failures/stats", headers=headers).json()
         assert stats.get("resolved", 0) >= 1
+
+
+def test_normalize_iipa_and_3xipa():
+    from beers_crawler.untappd.parsers import normalize_menu_query, strip_style_suffixes
+
+    assert "double" in normalize_menu_query("Foo IIPA").lower() or "dipa" in normalize_menu_query("Foo IIPA").lower()
+    s = strip_style_suffixes("Monkish Faces of Phases 3xIPA")
+    assert "3x" not in s.lower() or "ipa" not in s.lower().split()[-1:]
+    assert "phases" in s.lower() or "faces" in s.lower()
+
+
+def test_llm_json_extract():
+    from beers_crawler.llm import _extract_json_object
+
+    d = _extract_json_object('{"beer_name":"Haole Punch","brewery_name":"Alvarado Street","search_queries":["Haole Punch"]}')
+    assert d and d["beer_name"] == "Haole Punch"
+    d2 = _extract_json_object("```json\n{\"beer_name\":\"X\",\"search_queries\":[\"X\"]}\n```")
+    assert d2 and d2["beer_name"] == "X"

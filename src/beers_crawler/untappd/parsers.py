@@ -70,6 +70,8 @@ STYLE_SUFFIX_TOKENS = frozenset(
     {
         "ipa",
         "dipa",
+        "iipa",  # double IPA acronym (also normalized from IIPA)
+        "tipa",  # triple IPA
         "ddh",
         "neipa",
         "hazy",
@@ -131,6 +133,13 @@ KNOWN_BREWERY_PREFIXES: tuple[tuple[str, ...], ...] = (
     ("dogfish", "head"),
     ("new", "belgium"),
     ("new", "glarus"),
+    ("alvarado", "street"),
+    ("alvarado", "st"),
+    ("half", "acre"),
+    ("urban", "roots"),
+    ("great", "notion"),
+    ("barreled", "souls"),
+    ("pure", "project"),
     ("bells",),
     ("bell's",),
     ("stone",),
@@ -141,7 +150,64 @@ KNOWN_BREWERY_PREFIXES: tuple[tuple[str, ...], ...] = (
     ("fieldwork",),
     ("odell",),
     ("odell", "brewing"),
+    ("cellarmaker",),
+    ("monkish",),
+    ("highland", "park"),
+    ("altamont",),
+    ("cooperage",),
 )
+
+# Brewery street/abbreviation expansions applied before tokenization.
+# Order matters for multi-word replacements.
+_BREWERY_ABBREV_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"\bAlvarado\s+St\.?\b", re.I), "Alvarado Street"),
+    (re.compile(r"\bHalf\s+Acre\b", re.I), "Half Acre"),
+    (re.compile(r"\bSt\.?\s+Brew", re.I), "Street Brew"),  # generic "… St Brewery"
+)
+
+# Menu/OCR IPA strength acronyms → words we strip as styles (or keep as double/triple).
+_IPA_ACRONYM_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    # 3xIPA / 3X IPA / xxxIPA → triple ipa (then stripped as style suffix)
+    (re.compile(r"\b(\d)\s*[xX×]\s*IPA\b", re.I), r"\1x ipa"),
+    (re.compile(r"\bIII\s*IPA\b", re.I), "triple ipa"),
+    (re.compile(r"\bII\s*IPA\b", re.I), "double ipa"),
+    (re.compile(r"\bIIPA\b", re.I), "double ipa"),
+    (re.compile(r"\bDIPA\b", re.I), "double ipa"),
+    (re.compile(r"\bTIPA\b", re.I), "triple ipa"),
+    (re.compile(r"\b3X?IPA\b", re.I), "triple ipa"),
+    (re.compile(r"\b2X?IPA\b", re.I), "double ipa"),
+    (re.compile(r"\bx{3}\s*IPA\b", re.I), "triple ipa"),
+    (re.compile(r"\bx{2}\s*IPA\b", re.I), "double ipa"),
+)
+
+
+def normalize_menu_query(query: str) -> str:
+    """Clean OCR/menu noise before split/search.
+
+    - Expand brewery abbreviations (St. → Street)
+    - Normalize IPA strength acronyms (IIPA, 3xIPA)
+    - Drop trailing serving markers like (s), (S)
+    """
+    q = " ".join(query.split())
+    if not q:
+        return q
+    # Serving / size markers often glued by OCR: Haole Punch(s), Evangeline(S)
+    q = re.sub(r"\(\s*[sS]\s*\)", " ", q)
+    q = re.sub(r"\(\s*\)", " ", q)
+    for pat, repl in _BREWERY_ABBREV_PATTERNS:
+        q = pat.sub(repl, q)
+    # "St." → "Street" can leave a stray period: "Street. Haole"
+    q = re.sub(r"\bStreet\.\b", "Street", q)
+    q = re.sub(r"\s+\.", " ", q)
+    for pat, repl in _IPA_ACRONYM_PATTERNS:
+        q = pat.sub(repl, q)
+    # "3x ipa" / "double ipa" as trailing styles — collapse to tokens strip_style knows
+    q = re.sub(r"\b(\d)\s*x\s+ipa\b", r"\1xipa", q, flags=re.I)
+    q = re.sub(r"\bdouble\s+ipa\b", "dipa", q, flags=re.I)
+    q = re.sub(r"\btriple\s+ipa\b", "tipa", q, flags=re.I)
+    # OCR digit/letter confusion on IPA prefix: lIPA → IPA
+    q = re.sub(r"\blIPA\b", "IPA", q)
+    return " ".join(q.split())
 
 
 def strip_style_suffixes(query: str) -> str:
@@ -149,12 +215,19 @@ def strip_style_suffixes(query: str) -> str:
 
     Keeps at least two content tokens so we never collapse to a single word.
     """
-    raw = [t for t in re.split(r"\s+", query.strip()) if t]
-    if len(raw) < 3:
-        return query.strip()
+    q = normalize_menu_query(query)
+    raw = [t for t in re.split(r"\s+", q.strip()) if t]
+    if len(raw) < 2:
+        return q.strip()
     out = list(raw)
-    while len(out) >= 3:
+    # Allow stripping down to 2 tokens (brewery + beer) or 1 beer-only name
+    min_keep = 1 if len(out) <= 2 else 2
+    while len(out) > min_keep:
         last = re.sub(r"[^a-z0-9]+", "", out[-1].lower())
+        # 2xipa / 3xipa / tipa / dipa / iipa
+        if re.fullmatch(r"\d+x?ipa", last) or last in {"tipa", "dipa", "iipa"}:
+            out.pop()
+            continue
         if last in STYLE_SUFFIX_TOKENS or last in STOP_TOKENS:
             out.pop()
             continue
@@ -177,18 +250,14 @@ def beer_name_search_string(query: str) -> Optional[str]:
     Untappd's own UX works best searching the **beer name**, then picking the hit
     whose brewery matches — not ``\"Brewery Beer Name\"`` as one string.
     """
-    q0 = " ".join(query.split())
+    q0 = strip_style_suffixes(normalize_menu_query(query))
     if not q0:
         return None
-    q0 = strip_style_suffixes(q0)
     brewery, beer = split_query_hints(q0)
     if beer:
-        ordered = [
-            t for t in re.split(r"[^a-z0-9]+", q0.lower()) if t in beer
-        ]
+        ordered = [t for t in re.split(r"[^a-z0-9]+", q0.lower()) if t in beer]
         if ordered:
             return " ".join(ordered)
-    # No brewery split — whole query minus stops/styles
     cleaned = _drop_stop_tokens_keep_order(q0)
     return cleaned or q0
 
@@ -197,30 +266,31 @@ def search_query_variants(query: str) -> list[str]:
     """Ordered unique Algolia/query strings — **beer name first**, then fallbacks.
 
     Order matters (Untappd-app style):
-      1. beer name only (e.g. ``Wandering Don``, ``Bombay Boat``)
-      2. beer name without internal stopwords already applied above
-      3. full query stripped of trailing styles
-      4. full original query (last resort)
+      1. beer name only (e.g. ``Wandering Don``, ``Haole Punch``)
+      2. full query stripped of trailing styles / expanded abbreviations
+      3. original query (last resort)
     Brewery is applied later when ranking hits, not in the primary search string.
     """
-    q0 = " ".join(query.split())
-    if not q0:
+    original = " ".join(query.split())
+    if not original:
         return []
+    normalized = normalize_menu_query(original)
 
     variants: list[str] = []
-    beer_only = beer_name_search_string(q0)
+    beer_only = beer_name_search_string(normalized)
     if beer_only:
         variants.append(beer_only)
-        # If beer name has apostrophe-ish OCR forms, bare tokens already lowercased
 
-    stripped = strip_style_suffixes(q0)
+    stripped = strip_style_suffixes(normalized)
     if stripped:
         variants.append(stripped)
         ds = _drop_stop_tokens_keep_order(stripped)
         if ds:
             variants.append(ds)
 
-    variants.append(q0)
+    variants.append(normalized)
+    if original.lower() != normalized.lower():
+        variants.append(original)
 
     seen: set[str] = set()
     out: list[str] = []
@@ -258,16 +328,19 @@ def split_query_hints(query: str) -> tuple[set[str], set[str]]:
     """Heuristic split of free-text query into brewery-ish vs beer-name tokens.
 
     Untappd queries are usually ``\"Brewery Beer Name\"``. Known two-word
-    breweries (Firestone Walker, Russian River, …) take priority so beer-name
-    tokens stay intact. Otherwise prefer a single leading brewery token for
-    short queries (``Moonlight Bombay by Boat``).
+    breweries (Firestone Walker, Russian River, Alvarado Street, …) take
+    priority so beer-name tokens stay intact.
     """
-    # Score/match should ignore trailing style suffixes
-    q = strip_style_suffixes(query)
+    q = strip_style_suffixes(normalize_menu_query(query))
     raw = [t for t in re.split(r"[^a-z0-9]+", q.lower()) if t]
+    # Keep street/st in the stream for brewery prefix matching; drop from beer side later.
+    brewery_noise = {"st", "street", "co", "brewing", "brewery", "company"}
     content = [t for t in raw if t not in STOP_TOKENS and len(t) >= 2]
     if not content:
         return set(), set(raw)
+
+    def _beer_tokens(seq: list[str]) -> set[str]:
+        return {t for t in seq if t not in STOP_TOKENS and t not in brewery_noise and len(t) >= 2}
 
     # Known brewery prefix at start (1+ tokens) — even for short "Brewery Beer" pairs
     for prefix in KNOWN_BREWERY_PREFIXES:
@@ -277,8 +350,10 @@ def split_query_hints(query: str) -> tuple[set[str], set[str]]:
         n = len(pref)
         if content[:n] == list(pref) and len(content) > n:
             brewery = set(pref)
-            beer = set(content[n:])
-            beer = {t for t in beer if t not in STOP_TOKENS} or set(content[n:])
+            # Expand st → street for matching brewery_name "Alvarado Street …"
+            if "st" in brewery:
+                brewery.add("street")
+            beer = _beer_tokens(content[n:]) or set(content[n:])
             return brewery, beer
 
     # Single content token — beer only
@@ -286,20 +361,17 @@ def split_query_hints(query: str) -> tuple[set[str], set[str]]:
         return set(), set(content)
 
     # Two tokens, unknown brewery: treat as beer-only (avoid stealing name tokens)
-    # unless first token is a known single-word brewery (handled above).
     if len(content) == 2:
         return set(), set(content)
 
     # ≥5 content tokens: two-word brewery guess
     if len(content) >= 5:
         brewery = set(content[:2])
-        beer = set(content[2:])
+        beer = _beer_tokens(content[2:]) or set(content[2:])
     else:
-        # 3–4 tokens: first token brewery, rest beer
         brewery = {content[0]}
-        beer = set(content[1:])
+        beer = _beer_tokens(content[1:]) or set(content[1:])
 
-    beer = {t for t in beer if t not in STOP_TOKENS} or set(content[1:])
     return brewery, beer
 
 
@@ -332,44 +404,99 @@ def match_score(query: str, slug: str, link_text: str = "", *, in_primary_list: 
 
     brewery_tokens, beer_tokens = split_query_hints(query)
     brewery_hit = bool(brewery_tokens and (brewery_tokens & s))
-    # Beer-name: prefer distinctive tokens (≥3 chars) appearing in slug
+    # Beer-name: require ALL distinctive tokens (≥3 chars) in slug or text
     distinctive_beer = {t for t in beer_tokens if len(t) >= 3}
     beer_hit = False
+    beer_all_hit = False
     if distinctive_beer:
-        beer_hit = any(t in slug_l for t in distinctive_beer) or bool(distinctive_beer & s)
+        beer_all_hit = distinctive_beer.issubset(s) or all(
+            t in slug_l for t in distinctive_beer
+        )
+        beer_hit = beer_all_hit or bool(distinctive_beer & s)
     elif beer_tokens:
         beer_hit = bool(beer_tokens & s)
+        beer_all_hit = beer_tokens.issubset(s)
 
     if brewery_tokens and beer_tokens:
-        if brewery_hit and beer_hit:
+        if brewery_hit and beer_all_hit:
             bonus += 0.25
-        elif beer_hit and not brewery_hit:
-            # Beer name alone can still win (toronado allows this)
+        elif brewery_hit and beer_hit and not beer_all_hit:
+            # Partial beer-name match (e.g. only "punch") — weak
+            bonus -= 0.15
+        elif beer_all_hit and not brewery_hit:
             bonus += 0.05
         elif brewery_hit and not beer_hit:
-            # Brewery-only match without the beer name is almost always wrong
-            # (Algolia removeWordsIfNoResults returns other beers from same brewery).
             overlap -= 0.55
         else:
-            # Neither brewery nor beer name — almost certainly wrong
             overlap -= 0.5
     elif beer_tokens and not beer_hit:
         overlap -= 0.25
 
-    # Require at least one distinctive beer token when query has any
-    if distinctive_beer and not beer_hit:
-        return max(0.0, min(0.35, overlap + bonus - 0.2))
+    # Missing any distinctive beer token → hard reject floor
+    if distinctive_beer and not beer_all_hit:
+        return max(0.0, min(0.35, overlap + bonus - 0.25))
 
     # Phrase-level: beer tokens as hyphenated run in slug
     if distinctive_beer:
         ordered = [
             t
-            for t in re.split(r"[^a-z0-9]+", query.lower())
+            for t in re.split(
+                r"[^a-z0-9]+",
+                strip_style_suffixes(normalize_menu_query(query)).lower(),
+            )
             if t in distinctive_beer
         ]
         beer_phrase = "-".join(ordered)
         if beer_phrase and len(beer_phrase) >= 4 and beer_phrase in slug_l:
             bonus += 0.1
+
+    # Prefer exact beer_name over longer variants (Haole Punch vs Haole Punch Vanilla)
+    exact_title = False
+    longer_variant = False
+    if distinctive_beer and link_text:
+        beer_title = link_text.strip().split("\n")[0].strip()
+        title_tokens = {
+            t
+            for t in re.split(r"[^a-z0-9]+", beer_title.lower())
+            if len(t) >= 2
+            and t not in STOP_TOKENS
+            and t not in STYLE_SUFFIX_TOKENS
+        }
+        title_beer = title_tokens - brewery_tokens - {
+            "brewing",
+            "brewery",
+            "company",
+            "co",
+            "street",
+            "st",
+        }
+        if title_beer:
+            if title_beer == distinctive_beer:
+                exact_title = True
+                bonus += 0.2
+            elif distinctive_beer < title_beer:
+                longer_variant = True
+                extra = title_beer - distinctive_beer
+                year_only = bool(extra) and all(t.isdigit() for t in extra)
+                variant_noise = {
+                    "vanilla",
+                    "mega",
+                    "gnar",
+                    "double",
+                    "triple",
+                    "imperial",
+                    "nitro",
+                    "howzit",
+                }
+                if year_only:
+                    # Vintage year on an otherwise exact name — mild preference loss only
+                    bonus -= 0.05
+                    longer_variant = False
+                    exact_title = True  # treat as base beer with year
+                elif extra & variant_noise:
+                    bonus -= 0.35
+                else:
+                    bonus -= 0.2
 
     blob = " ".join(q)
     for brand in MEGA_BRANDS:
@@ -381,7 +508,11 @@ def match_score(query: str, slug: str, link_text: str = "", *, in_primary_list: 
     if not in_primary_list:
         overlap -= 0.35
 
-    return max(0.0, min(1.0, overlap + bonus))
+    score = overlap + bonus
+    # Keep flavored/longer variants below exact (or year-stamped) titles
+    if longer_variant and not exact_title:
+        score = min(score, 0.87)
+    return max(0.0, min(1.0, score))
 
 
 def _ancestor_classes(tag: Tag, depth: int = 8) -> set[str]:
