@@ -104,11 +104,13 @@ BEERS_CRAWLER_CORS=https://www.example.com,https://example.com
 
 On this **1 GB VPS**, production uses:
 
-- `PREFER_HTTPX=1` + `ALLOW_PLAYWRIGHT=0` (Chromium OOMs / missing headless_shell)
-- **DuckDuckGo HTML** fallback to resolve Untappd `/b/` URLs when Untappd search is JS-only
+- `PREFER_HTTPX=1` + `ALLOW_PLAYWRIGHT=0` (Chromium needs ~extra libs + RAM; OOMs here)
+- External search fallback to resolve Untappd `/b/` URLs when Untappd search is JS-only:
+  **Brave → DuckDuckGo HTML → DDG lite**
 - Beer **detail** pages usually work with plain httpx (JSON-LD ratings)
+- Fresh history (6h) avoids re-hitting search engines
 
-Optional later: move crawl workers to a larger host and set `ALLOW_PLAYWRIGHT=1`.
+**Caveat:** free search endpoints may return 202/429 from the VPS IP. Cached history still serves prior successful crawls. For always-on live resolve, use a larger host with Playwright (`ALLOW_PLAYWRIGHT=1` + `playwright install chromium`).
 
 ---
 
