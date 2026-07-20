@@ -1,22 +1,44 @@
 #!/usr/bin/env bash
-# Deploy beers-crawler API + web UI to example.com without wiping SQLite history.
+# Deploy beers-crawler API + web UI without wiping SQLite history.
 #
-# Usage (from laptop, repo root):
+# Setup (once):
+#   cp deploy/deploy.env.example deploy/deploy.env
+#   $EDITOR deploy/deploy.env   # set host, paths, nginx site
+#
+# Usage (from repo root):
 #   ./scripts/deploy.sh
-#   ./scripts/deploy.sh --host you@your-server.example
 #   ./scripts/deploy.sh --skip-build
 #   ./scripts/deploy.sh --dry-run
+#   DEPLOY_HOST=user@host DEPLOY_ROOT=/var/www/beers-crawler ./scripts/deploy.sh
 #
 # Safe by design:
 #   - NEVER rsyncs/deletes remote data/ (beers.db history)
 #   - NEVER overwrites remote env if it already exists
 #   - Code + web/dist are updated; service is restarted
+#   - Host/path details live in gitignored deploy/deploy.env
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-HOST="${DEPLOY_HOST:-you@your-server.example}"
-REMOTE_ROOT="${DEPLOY_ROOT:-/var/www/beers-crawler}"
+
+# Load local deploy config if present (gitignored)
+if [[ -f "$ROOT/deploy/deploy.env" ]]; then
+  # shellcheck disable=SC1091
+  set -a
+  # shellcheck source=/dev/null
+  source "$ROOT/deploy/deploy.env"
+  set +a
+fi
+
+HOST="${DEPLOY_HOST:-}"
+REMOTE_ROOT="${DEPLOY_ROOT:-}"
+PUBLIC_ORIGINS="${DEPLOY_PUBLIC_ORIGINS:-}"
+PUBLIC_BASE="${DEPLOY_PUBLIC_BASE:-}"
+NGINX_SITE_CONF="${DEPLOY_NGINX_SITE_CONF:-}"
+NGINX_SERVER_NAME="${DEPLOY_NGINX_SERVER_NAME:-}"
+SERVICE_USER="${DEPLOY_SERVICE_USER:-}"
+SERVICE_GROUP="${DEPLOY_SERVICE_GROUP:-$SERVICE_USER}"
+
 SSH_OPTS=(-o BatchMode=yes -o StrictHostKeyChecking=accept-new)
 SKIP_BUILD=0
 DRY_RUN=0
@@ -32,12 +54,38 @@ while [[ $# -gt 0 ]]; do
     --no-systemd) INSTALL_SYSTEMD=0; shift ;;
     --no-nginx) INSTALL_NGINX=0; shift ;;
     -h|--help)
-      sed -n '2,20p' "$0"
+      sed -n '2,22p' "$0"
       exit 0
       ;;
     *) echo "Unknown arg: $1" >&2; exit 1 ;;
   esac
 done
+
+if [[ -z "$HOST" || -z "$REMOTE_ROOT" ]]; then
+  cat >&2 <<'ERR'
+Missing DEPLOY_HOST and/or DEPLOY_ROOT.
+
+Create a local (gitignored) config:
+  cp deploy/deploy.env.example deploy/deploy.env
+  edit deploy/deploy.env
+
+Or pass env vars:
+  DEPLOY_HOST=user@host DEPLOY_ROOT=/var/www/beers-crawler ./scripts/deploy.sh
+ERR
+  exit 1
+fi
+
+if [[ "$INSTALL_SYSTEMD" -eq 1 && -z "$SERVICE_USER" ]]; then
+  echo "DEPLOY_SERVICE_USER is required when installing systemd (set in deploy/deploy.env)" >&2
+  exit 1
+fi
+
+if [[ "$INSTALL_NGINX" -eq 1 ]]; then
+  if [[ -z "$NGINX_SITE_CONF" || -z "$NGINX_SERVER_NAME" ]]; then
+    echo "DEPLOY_NGINX_SITE_CONF and DEPLOY_NGINX_SERVER_NAME required for nginx install (or pass --no-nginx)" >&2
+    exit 1
+  fi
+fi
 
 ssh_run() {
   # shellcheck disable=SC2029
@@ -73,19 +121,21 @@ echo "==> Ensuring remote layout (data/ preserved)"
 ssh_run "bash -s" <<EOF
 set -euo pipefail
 ROOT="$REMOTE_ROOT"
+ORIGINS="$PUBLIC_ORIGINS"
 mkdir -p "\$ROOT"/{app,data,logs,web/dist,deploy,.local/bin}
 if [[ ! -f "\$ROOT/env" ]]; then
-  cat > "\$ROOT/env" <<ENV
-BEERS_CRAWLER_DB=$REMOTE_ROOT/data/beers.db
-BEERS_CRAWLER_PREFER_HTTPX=1
-BEERS_CRAWLER_ALLOW_PLAYWRIGHT=0
-BEERS_CRAWLER_MIN_REFRESH_SECONDS=21600
-BEERS_CRAWLER_CORS=https://www.example.com,https://example.com
-ENV
+  {
+    echo "BEERS_CRAWLER_DB=\$ROOT/data/beers.db"
+    echo "BEERS_CRAWLER_PREFER_HTTPX=1"
+    echo "BEERS_CRAWLER_ALLOW_PLAYWRIGHT=0"
+    echo "BEERS_CRAWLER_MIN_REFRESH_SECONDS=21600"
+    if [[ -n "\$ORIGINS" ]]; then
+      echo "BEERS_CRAWLER_CORS=\$ORIGINS"
+    fi
+  } > "\$ROOT/env"
   echo "Created \$ROOT/env"
 else
   echo "Keeping existing \$ROOT/env"
-  # Non-destructive: add ALLOW_PLAYWRIGHT=0 only if key missing
   if ! grep -q '^BEERS_CRAWLER_ALLOW_PLAYWRIGHT=' "\$ROOT/env"; then
     echo 'BEERS_CRAWLER_ALLOW_PLAYWRIGHT=0' >> "\$ROOT/env"
     echo "Appended BEERS_CRAWLER_ALLOW_PLAYWRIGHT=0"
@@ -95,7 +145,7 @@ ls -la "\$ROOT/data" || true
 df -h / | tail -1
 EOF
 
-# --- 3. Rsync code (exclude data, venv, caches) ---
+# --- 3. Rsync code (exclude data, venv, caches, local deploy secrets) ---
 echo "==> Rsync app code → ${REMOTE_ROOT}/app/"
 rsync -az --delete \
   --exclude '.git/' \
@@ -111,6 +161,9 @@ rsync -az --delete \
   --exclude '*.db' \
   --exclude '*.db-wal' \
   --exclude '*.db-shm' \
+  --exclude 'deploy/deploy.env' \
+  --exclude '.env' \
+  --exclude '.env.*' \
   -e "$RSYNC_SSH" \
   "$ROOT/" "$HOST:$REMOTE_ROOT/app/"
 
@@ -121,6 +174,7 @@ rsync -az --delete \
 
 echo "==> Rsync deploy helpers → ${REMOTE_ROOT}/deploy/"
 rsync -az \
+  --exclude 'deploy.env' \
   -e "$RSYNC_SSH" \
   "$ROOT/deploy/" "$HOST:$REMOTE_ROOT/deploy/"
 
@@ -144,12 +198,13 @@ cd "\$ROOT/app"
 export UV_PROJECT_ENVIRONMENT="\$ROOT/app/.venv"
 "\$ROOT/.local/bin/uv" sync --no-dev
 
-if grep -q 'BEERS_CRAWLER_PREFER_HTTPX=0' "\$ROOT/env" 2>/dev/null; then
-  echo "Installing Playwright chromium…"
+if grep -q 'BEERS_CRAWLER_PREFER_HTTPX=0' "\$ROOT/env" 2>/dev/null \
+   || grep -q 'BEERS_CRAWLER_ALLOW_PLAYWRIGHT=1' "\$ROOT/env" 2>/dev/null; then
+  echo "Playwright enabled in env — installing chromium if needed…"
   "\$ROOT/.local/bin/uv" run playwright install-deps chromium 2>/dev/null || true
   "\$ROOT/.local/bin/uv" run playwright install chromium || true
 else
-  echo "Skipping Playwright browser install (BEERS_CRAWLER_PREFER_HTTPX=1)"
+  echo "Skipping Playwright browser install (httpx / external-search mode)"
 fi
 
 touch "\$ROOT/data/.keep"
@@ -163,6 +218,8 @@ if [[ "$INSTALL_SYSTEMD" -eq 1 ]]; then
   ssh_run "bash -s" <<EOF
 set -euo pipefail
 ROOT="$REMOTE_ROOT"
+USER_NAME="$SERVICE_USER"
+GROUP_NAME="$SERVICE_GROUP"
 sudo tee /etc/systemd/system/beers-crawler.service >/dev/null <<UNIT
 [Unit]
 Description=beers-crawler Untappd API (uvicorn)
@@ -170,19 +227,19 @@ After=network.target
 
 [Service]
 Type=simple
-User=tin
-Group=tin
-WorkingDirectory=$REMOTE_ROOT/app
-EnvironmentFile=-$REMOTE_ROOT/env
-Environment=BEERS_CRAWLER_DB=$REMOTE_ROOT/data/beers.db
-Environment=PATH=$REMOTE_ROOT/.local/bin:/usr/local/bin:/usr/bin:/bin
-ExecStart=$REMOTE_ROOT/.local/bin/uv run uvicorn beers_crawler.api:app --host 127.0.0.1 --port 8741 --workers 1
+User=\${USER_NAME}
+Group=\${GROUP_NAME}
+WorkingDirectory=\${ROOT}/app
+EnvironmentFile=-\${ROOT}/env
+Environment=BEERS_CRAWLER_DB=\${ROOT}/data/beers.db
+Environment=PATH=\${ROOT}/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=\${ROOT}/.local/bin/uv run uvicorn beers_crawler.api:app --host 127.0.0.1 --port 8741 --workers 1
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=true
 MemoryMax=512M
-StandardOutput=append:$REMOTE_ROOT/logs/api.log
-StandardError=append:$REMOTE_ROOT/logs/api.log
+StandardOutput=append:\${ROOT}/logs/api.log
+StandardError=append:\${ROOT}/logs/api.log
 
 [Install]
 WantedBy=multi-user.target
@@ -198,29 +255,37 @@ fi
 # --- 6. nginx snippet ---
 if [[ "$INSTALL_NGINX" -eq 1 ]]; then
   echo "==> Install nginx locations for /beers/rating/"
-  ssh_run "bash -s" <<'EOF'
+  ssh_run "bash -s" <<EOF
 set -euo pipefail
-ROOT="/var/www/beers-crawler"
+ROOT="$REMOTE_ROOT"
 SNIP="/etc/nginx/snippets/beers-rating.conf"
+SITE_CONF="$NGINX_SITE_CONF"
+SERVER_NAME="$NGINX_SERVER_NAME"
 sudo mkdir -p /etc/nginx/snippets
-sudo cp "$ROOT/deploy/nginx-beers-rating.conf" "$SNIP"
+# Render alias path into snippet
+sudo sed "s|DEPLOY_ROOT|\${ROOT}|g" "\$ROOT/deploy/nginx-beers-rating.conf" | sudo tee "\$SNIP" >/dev/null
 
-CONF="/etc/nginx/sites-enabled/example.com.conf"
-if ! grep -q 'snippets/beers-rating.conf' "$CONF"; then
-  sudo cp "$CONF" "${CONF}.bak.beers-$(date +%Y%m%d%H%M%S)"
-  sudo python3 - <<'PY'
+if [[ ! -f "\$SITE_CONF" ]]; then
+  echo "nginx site conf not found: \$SITE_CONF" >&2
+  exit 1
+fi
+
+if ! grep -q 'snippets/beers-rating.conf' "\$SITE_CONF"; then
+  sudo cp "\$SITE_CONF" "\${SITE_CONF}.bak.beers-\$(date +%Y%m%d%H%M%S)"
+  sudo python3 - "\$SITE_CONF" "\$SERVER_NAME" <<'PY'
+import sys
 from pathlib import Path
-path = Path("/etc/nginx/sites-enabled/example.com.conf")
+path = Path(sys.argv[1])
+server_name = sys.argv[2]
 text = path.read_text()
-needle = "server_name www.example.com;"
+needle = f"server_name {server_name};"
 include_line = "\n    # beers-crawler SPA + API\n    include /etc/nginx/snippets/beers-rating.conf;\n"
 if "snippets/beers-rating.conf" in text:
     print("nginx already includes beers-rating snippet")
 elif needle not in text:
     raise SystemExit(f"Could not find {needle!r} in {path}")
 else:
-    text = text.replace(needle, needle + include_line, 1)
-    path.write_text(text)
+    path.write_text(text.replace(needle, needle + include_line, 1))
     print("Patched", path)
 PY
 else
@@ -250,18 +315,22 @@ ls -la "$REMOTE_ROOT/data"
 test -f "$REMOTE_ROOT/web/dist/index.html"
 EOF
 
-echo "==> Public URL checks"
-set +e
-curl -fsSI "https://www.example.com/beers/rating/" | head -20
-echo "---"
-curl -fsS "https://www.example.com/beers/rating/api/health"
-echo
-set -e
+if [[ -n "$PUBLIC_BASE" ]]; then
+  echo "==> Public URL checks"
+  set +e
+  curl -fsSI "${PUBLIC_BASE}/" | head -20
+  echo "---"
+  curl -fsS "${PUBLIC_BASE}/api/health"
+  echo
+  set -e
+  echo "  UI:  ${PUBLIC_BASE}/"
+  echo "  API: ${PUBLIC_BASE}/api/health"
+else
+  echo "==> Skipping public URL checks (DEPLOY_PUBLIC_BASE unset)"
+fi
 
 echo
 echo "Done."
-echo "  UI:  https://www.example.com/beers/rating/"
-echo "  API: https://www.example.com/beers/rating/api/health"
 echo "  DB:  ${REMOTE_ROOT}/data/beers.db  (preserved across deploys)"
 echo "  Logs:${REMOTE_ROOT}/logs/api.log"
 echo "  Redeploy: ./scripts/deploy.sh"

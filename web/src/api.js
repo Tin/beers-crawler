@@ -3,7 +3,7 @@
  *  1. resolve  — beer name → Untappd page URL
  *  2. metadata — Untappd page URL → beer metadata (rating_score primary)
  *
- * Production (example.com): VITE_API_BASE=/beers/rating/api
+ * Production under /beers/rating/: VITE_API_BASE=/beers/rating/api
  * Local Vite dev: same base (proxied) or empty for bare /v1
  */
 

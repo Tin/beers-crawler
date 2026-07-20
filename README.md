@@ -111,7 +111,7 @@ Optional query/body: `history_only=true`, `force=true`.
 
 Minimal SPA under [`web/`](./web) exposing **resolve** + **metadata** with a readable result card.
 
-**Production:** https://www.example.com/beers/rating/ — see [`deploy/DEPLOY.md`](./deploy/DEPLOY.md).
+**Production deploy:** see [`deploy/DEPLOY.md`](./deploy/DEPLOY.md) (host-specific settings live in gitignored `deploy/deploy.env`).
 
 ```bash
 # terminal 1
@@ -122,6 +122,7 @@ cd web && npm install && npm run dev
 # → http://127.0.0.1:5173
 
 # Deploy API + UI (preserves remote SQLite history)
+cp deploy/deploy.env.example deploy/deploy.env   # once
 ./scripts/deploy.sh
 ```
 

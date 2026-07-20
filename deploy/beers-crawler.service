@@ -1,29 +1,23 @@
+# Template unit. scripts/deploy.sh writes a concrete unit with paths from deploy.env.
 [Unit]
 Description=beers-crawler Untappd API (uvicorn)
 After=network.target
 
 [Service]
 Type=simple
-User=tin
-Group=tin
-WorkingDirectory=/var/www/beers-crawler/app
-EnvironmentFile=-/var/www/beers-crawler/env
-Environment=BEERS_CRAWLER_DB=/var/www/beers-crawler/data/beers.db
-Environment=BEERS_CRAWLER_PREFER_HTTPX=1
-Environment=BEERS_CRAWLER_MIN_REFRESH_SECONDS=21600
-# Low-memory host: single worker, no reload
-ExecStart=/var/www/beers-crawler/.local/bin/uv run uvicorn beers_crawler.api:app --host 127.0.0.1 --port 8741 --workers 1
+User=DEPLOY_SERVICE_USER
+Group=DEPLOY_SERVICE_GROUP
+WorkingDirectory=DEPLOY_ROOT/app
+EnvironmentFile=-DEPLOY_ROOT/env
+Environment=BEERS_CRAWLER_DB=DEPLOY_ROOT/data/beers.db
+Environment=PATH=DEPLOY_ROOT/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=DEPLOY_ROOT/.local/bin/uv run uvicorn beers_crawler.api:app --host 127.0.0.1 --port 8741 --workers 1
 Restart=on-failure
 RestartSec=5
-# Protect data dir from accidental wipes by the unit itself (not a full sandbox)
-ReadWritePaths=/var/www/beers-crawler/data /var/www/beers-crawler/logs
 NoNewPrivileges=true
-
-# Soft limits — Playwright is heavy; prefer httpx in prod
 MemoryMax=512M
-
-StandardOutput=append:/var/www/beers-crawler/logs/api.log
-StandardError=append:/var/www/beers-crawler/logs/api.log
+StandardOutput=append:DEPLOY_ROOT/logs/api.log
+StandardError=append:DEPLOY_ROOT/logs/api.log
 
 [Install]
 WantedBy=multi-user.target

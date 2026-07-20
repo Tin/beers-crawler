@@ -18,3 +18,13 @@ tests/fixtures/search_pliny.html
 # Vite / Vue
 web/node_modules/
 web/dist/
+
+# Local secrets / machine-specific deploy config (never commit)
+.env
+.env.*
+!.env.example
+deploy/deploy.env
+*.pem
+id_rsa
+id_ed25519
+*.key

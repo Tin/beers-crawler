@@ -4,7 +4,7 @@ import vue from '@vitejs/plugin-vue'
 // Dev: proxy API paths to beers-crawler serve (default :8741)
 const apiTarget = process.env.BEERS_CRAWLER_URL || 'http://127.0.0.1:8741'
 
-// Production path on example.com — override with VITE_BASE if needed
+// Production subpath — override with VITE_BASE if needed
 const base = process.env.VITE_BASE || '/beers/rating/'
 
 export default defineConfig({
