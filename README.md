@@ -1,6 +1,6 @@
 # beers-crawler
 
-Server-side Untappd crawler (CLI first, SQLite storage). Built to back apps like Toronado Viscosity with reliable beer page URLs and rating scores.
+Server-side Untappd crawler (CLI first, SQLite **history** storage). Built to back apps like Toronado Viscosity with reliable beer page URLs and rating scores.
 
 ## Interfaces
 
@@ -12,14 +12,22 @@ Server-side Untappd crawler (CLI first, SQLite storage). Built to back apps like
 ```text
 "Russian River Pliny the Elder"
         │
-        ▼  resolve_page()
+        ▼  resolve_page()          (live first)
 https://untappd.com/b/.../4499
         │
-        ▼  lookup_metadata()
-{ name, brewery, rating_score, rating_count, abv, ... }
+        ▼  lookup_metadata()       (live first → append history)
+{ name, brewery, rating_score, rating_count, scraped_at, ... }
 ```
 
-Implementation: Playwright (Chromium) + BeautifulSoup parsers + SQLite cache.
+### History policy
+
+Ratings drift over time. Every successful metadata crawl **appends** a timestamped row — nothing is overwritten.
+
+| Situation | Behavior |
+|-----------|----------|
+| Live crawl OK | Return fresh data; **append** history snapshot |
+| Live crawl fails | Return **latest** history snapshot if one exists (`from_history=true`) |
+| `--history-only` | Skip network; read latest history only |
 
 ## Setup
 
@@ -32,70 +40,94 @@ uv run playwright install chromium
 ## CLI
 
 ```bash
-# Create DB (also auto-created on first write)
 uv run beers-crawler init-db
 
-# 1) beer name → Untappd URL
+# 1) beer name → Untappd URL (live first, history fallback)
 uv run beers-crawler resolve "Russian River Pliny the Elder"
 uv run beers-crawler resolve "Moonlight Reality Czech" --json
 
-# 2) Untappd URL → metadata (rating)
+# 2) Untappd URL → metadata (appends history on success)
 uv run beers-crawler metadata "https://untappd.com/b/russian-river-brewing-company-pliny-the-elder/4499"
 
-# Combined (name → URL → metadata), cached in SQLite
+# Combined
 uv run beers-crawler crawl "Russian River Pliny the Elder" -v
 
-# Batch: one beer name per line
-uv run beers-crawler batch beers.txt --delay 2
+# Past snapshots for one beer
+uv run beers-crawler history "https://untappd.com/b/russian-river-brewing-company-pliny-the-elder/4499"
 
-# Inspect cache
+# Offline read of last known score
+uv run beers-crawler crawl "Russian River Pliny the Elder" --history-only
+
+# Batch (each success appends a history row)
+uv run beers-crawler batch beers.example.txt --delay 2
+
+# Ranked search candidates / cache stats / latest per beer
+uv run beers-crawler candidates "Russian River Pliny the Elder"
+uv run beers-crawler stats
 uv run beers-crawler list
+
+# HTTP API for Toronado / clients
+uv run beers-crawler serve --port 8741
+# docs: http://127.0.0.1:8741/docs
 ```
 
 Flags:
 
 - `--db PATH` — SQLite file (default `./data/beers.db`)
-- `--force` — ignore cache and re-fetch
-- `--no-cache` — do not read/write SQLite
+- `--history-only` — skip live crawl; read history only
+- `--no-history` — do not read/write SQLite history
 - `--headed` — show the browser
 - `--json` — machine-readable output
 - `-v` — debug logs
+
+## HTTP API
+
+| Method | Path | Notes |
+|--------|------|--------|
+| `GET` | `/health` | liveness + DB stats |
+| `GET` | `/v1/resolve?q=` | name → URL |
+| `GET` | `/v1/resolve/candidates?q=` | ranked candidates |
+| `GET` | `/v1/metadata?url=` | URL → metadata (live + append) |
+| `GET` | `/v1/metadata/history?url=` | all snapshots |
+| `POST` | `/v1/crawl` | `{ "name": "…" }` |
+| `GET` | `/v1/list` | latest snapshot per beer |
+
+Optional query/body: `history_only=true`.
 
 ## Project layout
 
 ```text
 src/beers_crawler/
   cli.py                 # click CLI
-  db.py                  # SQLite
+  api.py                 # FastAPI
+  db.py                  # SQLite (append-only metadata history)
   models.py              # BeerPageRef, BeerMetadata
-  service.py             # cache + orchestration
+  service.py             # live-first + history fallback
   untappd/
-    interfaces.py        # Protocol definitions for the two APIs
-    client.py            # Playwright UntappdClient
-    parsers.py           # HTML → models (no network)
+    interfaces.py
+    client.py            # Playwright (+ optional httpx)
+    parsers.py           # HTML → models
 tests/
 ```
 
-## SQLite schema (summary)
+## SQLite
 
-- **`beer_pages`** — query → page_url (+ match_score)
-- **`beer_metadata`** — page_url → name, brewery, **rating_score**, counts, etc.
+- **`beer_pages`** — latest search candidates per query (upsert)
+- **`beer_metadata`** — **append-only** crawl history (`page_url` + `scraped_at`); many rows per beer over time
 
-## Tests (offline parsers + DB)
+## Tests
 
 ```bash
 uv run pytest -q
 ```
 
-## Status
+Offline only (no live Untappd in CI).
 
-Live Untappd crawl verified (Pliny, Reality Czech, Sierra Nevada Pale Ale) with SQLite cache hits on re-run. See [`PLAN.md`](./PLAN.md).
+## Notes
 
-## Notes / next steps
-
-- Untappd may rate-limit or change DOM; parsers use JSON-LD + CSS + regex fallbacks.
+- Untappd may rate-limit or change DOM; parsers use primary beer-list + JSON-LD + CSS + regex fallbacks.
 - Be polite: batch mode defaults to a delay between beers.
-- Next: harden match ranking; optional HTTP API for Toronado Viscosity; web UI later.
+- See [`PLAN.md`](./PLAN.md) for roadmap.
 
 ## License
 

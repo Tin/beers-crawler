@@ -12,3 +12,6 @@ dist/
 *.egg-info/
 .python-version
 uv.lock
+# Keep compact fixtures; ignore huge raw captures
+tests/fixtures/*_raw.html
+tests/fixtures/search_pliny.html

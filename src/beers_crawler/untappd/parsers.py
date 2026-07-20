@@ -5,7 +5,7 @@ import re
 from typing import Any, Optional
 from urllib.parse import urljoin, urlparse
 
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 
 from beers_crawler.models import BeerMetadata, BeerPageRef, utc_now
 
@@ -13,6 +13,51 @@ UNTAPPD_ORIGIN = "https://untappd.com"
 BEER_PATH_RE = re.compile(
     r"(?:https?://(?:www\.)?untappd\.com)?/b/([a-z0-9\-]+)/(\d+)",
     re.I,
+)
+
+# Real beer search hits live here; featured mega-brands sit in sidebar.
+PRIMARY_LIST_SELECTORS = (
+    "div.results-container",
+    "div.result-list.beer-list",
+    "div.result-list",
+    "div.beer-list",
+)
+BEER_ITEM_SELECTOR = "div.beer-item"
+SIDEBAR_SELECTOR = "div.sidebar"
+
+# Soft-penalize when not in query (featured / promo junk).
+MEGA_BRANDS = frozenset(
+    {
+        "guinness",
+        "corona",
+        "heineken",
+        "stella",
+        "modelo",
+        "budweiser",
+        "bud-light",
+        "michelob",
+        "coors",
+        "miller",
+    }
+)
+
+# Tiny words that shouldn't count as beer-name anchors.
+STOP_TOKENS = frozenset(
+    {
+        "the",
+        "and",
+        "ale",
+        "ipa",
+        "beer",
+        "lager",
+        "brew",
+        "brewing",
+        "brewery",
+        "company",
+        "co",
+        "inc",
+        "llc",
+    }
 )
 
 
@@ -28,39 +73,192 @@ def _slug_tokens(text: str) -> set[str]:
     return {t for t in re.split(r"[^a-z0-9]+", text.lower()) if len(t) >= 2}
 
 
-def match_score(query: str, slug: str, link_text: str = "") -> float:
+def _normalized_phrase(text: str) -> str:
+    """Lowercase alnum joined with hyphens (mirrors toronado normalizedToken)."""
+    parts = re.findall(r"[a-z0-9]+", text.lower())
+    return "-".join(parts)
+
+
+def split_query_hints(query: str) -> tuple[set[str], set[str]]:
+    """Heuristic split of free-text query into brewery-ish vs beer-name tokens.
+
+    Untappd queries are usually ``\"Brewery Beer Name\"``. First 1–3 tokens that
+    look like a brewery prefix are treated as brewery; the rest as beer name.
+    If the query is short, all content tokens are beer-name tokens.
+    """
+    raw = [t for t in re.split(r"[^a-z0-9]+", query.lower()) if t]
+    content = [t for t in raw if t not in STOP_TOKENS and len(t) >= 2]
+    if not content:
+        return set(), set(raw)
+
+    # Single-token or two-token beer-only queries
+    if len(content) <= 2:
+        return set(), set(content)
+
+    # Prefer first token(s) as brewery when query is longer
+    # e.g. "russian river pliny the elder" → brewery={russian,river}, beer={pliny,elder}
+    brewery: set[str] = set()
+    beer: set[str] = set()
+    # Take leading run up to 3 content tokens as brewery candidate, rest as beer —
+    # but require beer side to keep at least one distinctive token.
+    if len(content) >= 4:
+        brewery = set(content[:2])
+        beer = set(content[2:])
+    else:
+        brewery = {content[0]}
+        beer = set(content[1:])
+
+    # Drop stop-ish leftovers from beer side already filtered
+    beer = {t for t in beer if t not in STOP_TOKENS} or set(content[len(content) // 2 :])
+    return brewery, beer
+
+
+def match_score(query: str, slug: str, link_text: str = "", *, in_primary_list: bool = True) -> float:
+    """Score a candidate beer page against a free-text query.
+
+    Higher is better. Incorporates:
+    - token overlap on slug + link text
+    - brewery / beer-name token presence (toronado-style)
+    - mega-brand penalty
+    - primary list vs sidebar/nav placement
+    """
     q = _slug_tokens(query)
-    s = _slug_tokens(slug.replace("-", " ") + " " + link_text)
+    hay = f"{slug.replace('-', ' ')} {link_text}"
+    s = _slug_tokens(hay)
+    slug_l = slug.lower()
     if not q:
         return 0.0
+
     overlap = len(q & s) / len(q)
-    # Prefer more specific multi-token hits
-    bonus = 0.15 if len(q & s) >= 2 else 0.0
-    # Soft-penalize mega brands when not in query
+    shared = q & s
+    bonus = 0.15 if len(shared) >= 2 else 0.0
+    if len(shared) >= 3:
+        bonus += 0.1
+
+    brewery_tokens, beer_tokens = split_query_hints(query)
+    brewery_hit = bool(brewery_tokens and (brewery_tokens & s))
+    # Beer-name: prefer distinctive tokens (≥3 chars) appearing in slug
+    distinctive_beer = {t for t in beer_tokens if len(t) >= 3}
+    beer_hit = False
+    if distinctive_beer:
+        beer_hit = any(t in slug_l for t in distinctive_beer) or bool(distinctive_beer & s)
+    elif beer_tokens:
+        beer_hit = bool(beer_tokens & s)
+
+    if brewery_tokens and beer_tokens:
+        if brewery_hit and beer_hit:
+            bonus += 0.25
+        elif beer_hit and not brewery_hit:
+            # Beer name alone can still win (toronado allows this)
+            bonus += 0.05
+        elif brewery_hit and not beer_hit:
+            overlap -= 0.15
+        else:
+            # Neither brewery nor beer name — almost certainly wrong
+            overlap -= 0.5
+    elif beer_tokens and not beer_hit:
+        overlap -= 0.25
+
+    # Phrase-level: beer tokens as hyphenated run in slug
+    if distinctive_beer:
+        ordered = [
+            t
+            for t in re.split(r"[^a-z0-9]+", query.lower())
+            if t in distinctive_beer
+        ]
+        beer_phrase = "-".join(ordered)
+        if beer_phrase and len(beer_phrase) >= 4 and beer_phrase in slug_l:
+            bonus += 0.1
+
     blob = " ".join(q)
-    if "guinness" in s and "guinness" not in blob:
-        overlap -= 0.8
+    for brand in MEGA_BRANDS:
+        brand_in_candidate = brand in s or brand in slug_l.replace("-", " ")
+        if brand_in_candidate and brand not in blob:
+            overlap -= 0.8
+            break
+
+    if not in_primary_list:
+        overlap -= 0.35
+
     return max(0.0, min(1.0, overlap + bonus))
 
 
+def _ancestor_classes(tag: Tag, depth: int = 8) -> set[str]:
+    classes: set[str] = set()
+    cur: Optional[Tag] = tag
+    for _ in range(depth):
+        if cur is None or not isinstance(cur, Tag):
+            break
+        for c in cur.get("class") or []:
+            classes.add(str(c).lower())
+        # also record id-ish signals via name
+        cur = cur.parent if isinstance(cur.parent, Tag) else None
+    return classes
+
+
+def _in_sidebar(tag: Tag) -> bool:
+    classes = _ancestor_classes(tag)
+    return "sidebar" in classes
+
+
+def _in_primary_list(tag: Tag) -> bool:
+    classes = _ancestor_classes(tag)
+    if "sidebar" in classes:
+        return False
+    return bool(
+        classes
+        & {
+            "beer-item",
+            "results-container",
+            "beer-list",
+            "result-list",
+        }
+    )
+
+
+def _beer_item_link_text(item: Tag, anchor: Tag) -> str:
+    """Prefer full beer-item text (name + brewery) over bare anchor label."""
+    name_el = item.select_one("p.name, .name")
+    brew_el = item.select_one("p.brewery, .brewery, a[href*='/brewery/'], a[href*='/w/']")
+    parts = [
+        name_el.get_text(" ", strip=True) if name_el else "",
+        brew_el.get_text(" ", strip=True) if brew_el else "",
+        anchor.get_text(" ", strip=True),
+    ]
+    return " ".join(p for p in parts if p)
+
+
 def parse_search_results(html: str, query: str) -> list[BeerPageRef]:
-    """Extract beer page candidates from Untappd search HTML."""
+    """Extract beer page candidates from Untappd search HTML.
+
+    Prefers anchors inside the main beer results list (``div.beer-item`` /
+    ``div.results-container``) over sidebar featured brands and bare raw URLs.
+    """
     soup = BeautifulSoup(html, "lxml")
     seen: set[str] = set()
     results: list[BeerPageRef] = []
 
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        norm = normalize_beer_url(href if href.startswith("http") else urljoin(UNTAPPD_ORIGIN, href))
-        if not norm or norm in seen:
-            continue
-        m = BEER_PATH_RE.search(norm)
-        if not m:
-            continue
+    def add(
+        norm: str,
+        slug: str,
+        beer_id: str,
+        text: str,
+        *,
+        in_primary: bool,
+        source: str,
+    ) -> None:
+        if norm in seen:
+            return
         seen.add(norm)
-        slug, beer_id = m.group(1), m.group(2)
-        text = a.get_text(" ", strip=True)
-        score = match_score(query, slug, text)
+        score = match_score(query, slug, text, in_primary_list=in_primary)
+        # Hard filter: if query has both brewery + beer hints, require at least
+        # one beer-name token in slug/text when score would otherwise pass.
+        brewery_tokens, beer_tokens = split_query_hints(query)
+        distinctive_beer = {t for t in beer_tokens if len(t) >= 3}
+        if brewery_tokens and distinctive_beer:
+            hay = f"{slug} {text}".lower()
+            if not any(t in hay for t in distinctive_beer):
+                score = min(score, 0.2)
         results.append(
             BeerPageRef(
                 query=query,
@@ -68,39 +266,130 @@ def parse_search_results(html: str, query: str) -> list[BeerPageRef]:
                 slug=slug,
                 beer_id=beer_id,
                 match_score=score,
-                source="untappd_search",
+                source=source,
             )
         )
 
-    # Also scan raw HTML for absolute URLs missed by anchors
+    # 1) Primary list beer-items first (best signal)
+    primary_roots: list[Tag] = []
+    for sel in PRIMARY_LIST_SELECTORS:
+        primary_roots.extend(soup.select(sel))
+    if not primary_roots:
+        primary_roots = [soup]  # type: ignore[list-item]
+
+    items = []
+    for root in primary_roots:
+        items.extend(root.select(BEER_ITEM_SELECTOR))
+
+    if items:
+        for item in items:
+            if _in_sidebar(item):
+                continue
+            for a in item.find_all("a", href=True):
+                href = a["href"]
+                norm = normalize_beer_url(
+                    href if href.startswith("http") else urljoin(UNTAPPD_ORIGIN, href)
+                )
+                if not norm:
+                    continue
+                m = BEER_PATH_RE.search(norm)
+                if not m:
+                    continue
+                text = _beer_item_link_text(item, a)
+                add(
+                    norm,
+                    m.group(1),
+                    m.group(2),
+                    text,
+                    in_primary=True,
+                    source="untappd_search_list",
+                )
+    else:
+        # Fallback: any anchor not in sidebar
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            norm = normalize_beer_url(
+                href if href.startswith("http") else urljoin(UNTAPPD_ORIGIN, href)
+            )
+            if not norm:
+                continue
+            m = BEER_PATH_RE.search(norm)
+            if not m:
+                continue
+            in_primary = _in_primary_list(a) and not _in_sidebar(a)
+            source = "untappd_search_list" if in_primary else "untappd_search"
+            add(
+                norm,
+                m.group(1),
+                m.group(2),
+                a.get_text(" ", strip=True),
+                in_primary=in_primary,
+                source=source,
+            )
+
+    # 2) Remaining anchors (sidebar etc.) at lower priority
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        norm = normalize_beer_url(
+            href if href.startswith("http") else urljoin(UNTAPPD_ORIGIN, href)
+        )
+        if not norm or norm in seen:
+            continue
+        m = BEER_PATH_RE.search(norm)
+        if not m:
+            continue
+        in_primary = _in_primary_list(a) and not _in_sidebar(a)
+        add(
+            norm,
+            m.group(1),
+            m.group(2),
+            a.get_text(" ", strip=True),
+            in_primary=in_primary,
+            source="untappd_search_sidebar" if _in_sidebar(a) else "untappd_search",
+        )
+
+    # 3) Raw HTML URLs missed by anchors
     for m in BEER_PATH_RE.finditer(html):
         norm = f"{UNTAPPD_ORIGIN}/b/{m.group(1)}/{m.group(2)}"
         if norm in seen:
             continue
-        seen.add(norm)
-        score = match_score(query, m.group(1), "")
-        results.append(
-            BeerPageRef(
-                query=query,
-                page_url=norm,
-                slug=m.group(1),
-                beer_id=m.group(2),
-                match_score=score,
-                source="untappd_search_raw",
-            )
+        add(
+            norm,
+            m.group(1),
+            m.group(2),
+            "",
+            in_primary=False,
+            source="untappd_search_raw",
         )
 
     results.sort(key=lambda r: r.match_score, reverse=True)
     return results
 
 
-def best_search_result(html: str, query: str, min_score: float = 0.25) -> Optional[BeerPageRef]:
+def best_search_result(
+    html: str, query: str, min_score: float = 0.25
+) -> Optional[BeerPageRef]:
     results = parse_search_results(html, query)
     if not results:
         return None
     top = results[0]
     if top.match_score < min_score:
         return None
+
+    # When query looks like "Brewery + Beer", require beer token in winner
+    brewery_tokens, beer_tokens = split_query_hints(query)
+    distinctive_beer = {t for t in beer_tokens if len(t) >= 3}
+    if brewery_tokens and distinctive_beer:
+        hay = f"{top.slug or ''} {top.page_url}".lower()
+        if not any(t in hay for t in distinctive_beer):
+            # try next candidates that satisfy beer token
+            for cand in results[1:]:
+                if cand.match_score < min_score:
+                    break
+                hay_c = f"{cand.slug or ''} {cand.page_url}".lower()
+                if any(t in hay_c for t in distinctive_beer):
+                    return cand
+            return None
     return top
 
 
@@ -109,7 +398,7 @@ def _first_number(patterns: list[str], text: str) -> Optional[float]:
         m = re.search(pat, text, re.I | re.S)
         if m:
             try:
-                return float(m.group(1))
+                return float(m.group(1).replace(",", ""))
             except ValueError:
                 continue
     return None
@@ -175,7 +464,9 @@ def parse_beer_page(html: str, page_url: str) -> BeerMetadata:
             name = h1.get_text(strip=True)
 
     if brewery is None:
-        brew_el = soup.select_one("p.brewery a, .brewery a, a[href*='/brewery/'], a[href*='/w/']")
+        brew_el = soup.select_one(
+            "p.brewery a, .brewery a, a[href*='/brewery/'], a[href*='/w/']"
+        )
         if brew_el:
             brewery = brew_el.get_text(strip=True)
 
@@ -184,7 +475,9 @@ def parse_beer_page(html: str, page_url: str) -> BeerMetadata:
         if style_el:
             style = style_el.get_text(strip=True)
 
-    desc_el = soup.select_one("div.beer-descrption-read-less, div.beer-description, .beer-descrption")
+    desc_el = soup.select_one(
+        "div.beer-descrption-read-less, div.beer-description, .beer-descrption"
+    )
     if desc_el:
         description = desc_el.get_text(" ", strip=True) or None
 
@@ -215,7 +508,7 @@ def parse_beer_page(html: str, page_url: str) -> BeerMetadata:
     if abv is None:
         abv = _first_number(
             [
-                r'ABV[^0-9]{0,20}([0-9]+(?:\.[0-9]+)?)\s*%',
+                r"ABV[^0-9]{0,20}([0-9]+(?:\.[0-9]+)?)\s*%",
                 r'"abv"\s*:\s*"?([0-9]+(?:\.[0-9]+)?)"?',
             ],
             text,
@@ -224,7 +517,7 @@ def parse_beer_page(html: str, page_url: str) -> BeerMetadata:
     if ibu is None:
         ibu = _first_number(
             [
-                r'IBU[^0-9]{0,20}([0-9]+(?:\.[0-9]+)?)',
+                r"IBU[^0-9]{0,20}([0-9]+(?:\.[0-9]+)?)",
                 r'"ibu"\s*:\s*"?([0-9]+(?:\.[0-9]+)?)"?',
             ],
             text,

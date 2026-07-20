@@ -5,8 +5,15 @@ import logging
 from typing import Optional
 from urllib.parse import quote_plus
 
+import httpx
+
 from beers_crawler.models import BeerMetadata, BeerPageRef
-from beers_crawler.untappd.parsers import best_search_result, normalize_beer_url, parse_beer_page
+from beers_crawler.untappd.parsers import (
+    normalize_beer_url,
+    parse_beer_page,
+    parse_search_results,
+    split_query_hints,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -17,11 +24,39 @@ USER_AGENT = (
 )
 
 
+def pick_best_candidate(
+    candidates: list[BeerPageRef], query: str, min_score: float = 0.25
+) -> Optional[BeerPageRef]:
+    """Select best candidate from a scored list (same rules as ``best_search_result``)."""
+    if not candidates:
+        return None
+    top = candidates[0]
+    if top.match_score < min_score:
+        return None
+
+    brewery_tokens, beer_tokens = split_query_hints(query)
+    distinctive_beer = {t for t in beer_tokens if len(t) >= 3}
+    if brewery_tokens and distinctive_beer:
+        hay = f"{top.slug or ''} {top.page_url}".lower()
+        if not any(t in hay for t in distinctive_beer):
+            for cand in candidates[1:]:
+                if cand.match_score < min_score:
+                    break
+                hay_c = f"{cand.slug or ''} {cand.page_url}".lower()
+                if any(t in hay_c for t in distinctive_beer):
+                    return cand
+            return None
+    return top
+
+
 class UntappdClient:
     """Playwright-backed Untappd client implementing both crawler interfaces.
 
     1. ``resolve_page(beer_name)`` → BeerPageRef (URL)
     2. ``lookup_metadata(page_url)`` → BeerMetadata (rating_score, …)
+
+    When ``prefer_httpx`` is True, try a static HTTP fetch first and fall back
+    to Playwright if the HTML lacks beer signals.
     """
 
     def __init__(
@@ -30,13 +65,23 @@ class UntappdClient:
         headless: bool = True,
         timeout_ms: int = 30_000,
         min_match_score: float = 0.25,
+        prefer_httpx: bool = False,
+        max_retries: int = 2,
     ) -> None:
         self.headless = headless
         self.timeout_ms = timeout_ms
         self.min_match_score = min_match_score
+        self.prefer_httpx = prefer_httpx
+        self.max_retries = max_retries
         self._playwright = None
         self._browser = None
         self._context = None
+        self._last_candidates: list[BeerPageRef] = []
+
+    @property
+    def last_candidates(self) -> list[BeerPageRef]:
+        """Candidates from the most recent resolve call."""
+        return list(self._last_candidates)
 
     async def __aenter__(self) -> "UntappdClient":
         await self.start()
@@ -70,7 +115,31 @@ class UntappdClient:
             await self._playwright.stop()
             self._playwright = None
 
-    async def _get_html(self, url: str, *, wait_selector: Optional[str] = None) -> str:
+    async def _get_html_httpx(self, url: str) -> Optional[str]:
+        timeout = self.timeout_ms / 1000.0
+        try:
+            async with httpx.AsyncClient(
+                headers={"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9"},
+                follow_redirects=True,
+                timeout=timeout,
+            ) as client:
+                resp = await client.get(url)
+                if resp.status_code == 429:
+                    logger.warning("httpx 429 for %s", url)
+                    return None
+                resp.raise_for_status()
+                text = resp.text
+                if "/b/" in text or "application/ld+json" in text:
+                    return text
+                logger.debug("httpx HTML lacked beer signals for %s", url)
+                return None
+        except Exception as exc:
+            logger.debug("httpx fetch failed for %s: %s", url, exc)
+            return None
+
+    async def _get_html_playwright(
+        self, url: str, *, wait_selector: Optional[str] = None
+    ) -> str:
         if self._context is None:
             await self.start()
         assert self._context is not None
@@ -82,34 +151,67 @@ class UntappdClient:
                     await page.wait_for_selector(wait_selector, timeout=8_000)
                 except Exception:
                     logger.debug("wait_selector %s not found for %s", wait_selector, url)
-            # Allow late JS content
             await page.wait_for_timeout(800)
             return await page.content()
         finally:
             await page.close()
+
+    async def _get_html(self, url: str, *, wait_selector: Optional[str] = None) -> str:
+        last_err: Optional[Exception] = None
+        attempts = max(1, self.max_retries + 1)
+        for attempt in range(attempts):
+            try:
+                if self.prefer_httpx:
+                    html = await self._get_html_httpx(url)
+                    if html:
+                        return html
+                    logger.info("httpx miss for %s; falling back to Playwright", url)
+                return await self._get_html_playwright(url, wait_selector=wait_selector)
+            except Exception as exc:
+                last_err = exc
+                backoff = 0.75 * (2**attempt)
+                logger.warning(
+                    "fetch attempt %s/%s failed for %s: %s; sleep %.1fs",
+                    attempt + 1,
+                    attempts,
+                    url,
+                    exc,
+                    backoff,
+                )
+                await asyncio.sleep(backoff)
+        assert last_err is not None
+        raise last_err
+
+    async def resolve_candidates(self, beer_name: str) -> list[BeerPageRef]:
+        """Return all scored search candidates (best first). Updates ``last_candidates``."""
+        query = beer_name.strip()
+        self._last_candidates = []
+        if not query:
+            return []
+        search_url = f"https://untappd.com/search?q={quote_plus(query)}&type=beer"
+        logger.info("searching Untappd for %r → %s", query, search_url)
+        html = await self._get_html(search_url, wait_selector="a[href*='/b/']")
+        results = parse_search_results(html, query)
+        self._last_candidates = results
+        logger.info("found %d candidates for %r", len(results), query)
+        return results
 
     async def resolve_page(self, beer_name: str) -> Optional[BeerPageRef]:
         """Interface 1: beer name string → Untappd page URL (best match)."""
         query = beer_name.strip()
         if not query:
             return None
-        search_url = (
-            f"https://untappd.com/search?q={quote_plus(query)}&type=beer"
-        )
-        logger.info("searching Untappd for %r → %s", query, search_url)
-        html = await self._get_html(
-            search_url,
-            wait_selector="a[href*='/b/']",
-        )
-        ref = best_search_result(html, query, min_score=self.min_match_score)
+        candidates = await self.resolve_candidates(query)
+        ref = pick_best_candidate(candidates, query, self.min_match_score)
         if ref is None:
             logger.warning("no Untappd beer page matched for %r", query)
         else:
             logger.info(
-                "resolved %r → %s (score=%.2f)",
+                "resolved %r → %s (score=%.2f, candidates=%d)",
                 query,
                 ref.page_url,
                 ref.match_score,
+                len(candidates),
             )
         return ref
 
@@ -134,7 +236,9 @@ class UntappdClient:
         )
         return meta
 
-    async def resolve_and_lookup(self, beer_name: str) -> tuple[Optional[BeerPageRef], Optional[BeerMetadata]]:
+    async def resolve_and_lookup(
+        self, beer_name: str
+    ) -> tuple[Optional[BeerPageRef], Optional[BeerMetadata]]:
         """Convenience: name → URL → metadata in one call."""
         ref = await self.resolve_page(beer_name)
         if ref is None:
