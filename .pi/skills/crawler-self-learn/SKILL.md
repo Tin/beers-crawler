@@ -110,8 +110,8 @@ curl -fsS "${AUTH[@]}" -X PATCH \
 
 ```bash
 uv run pytest -q
-# identity leak check on tracked files
-git grep -iE 'diamondtin|zztin|iamtin|public_html|/home/tin' $(git ls-files) && echo LEAK || echo clean
+# identity leak check on tracked files (adjust patterns to your org)
+git grep -iE 'public_html|/home/[a-z]+@|api_password\s*=' $(git ls-files) && echo LEAK || echo clean
 ```
 
 Deploy with `./scripts/deploy.sh` only if `deploy/deploy.env` exists locally (gitignored). Never commit credentials, hostnames, or absolute server paths.
