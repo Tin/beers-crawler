@@ -64,23 +64,30 @@ swift run ToronadoCoreSpecs
 
 ---
 
-## Web UI
+## Web UI + production deploy
 
-Vite + Vue SPA in `web/`:
+**Live:** https://www.example.com/beers/rating/
 
 ```bash
+# local
 uv run beers-crawler serve --port 8741
-cd web && npm run dev   # http://127.0.0.1:5173
+cd web && npm run dev
+
+# production (preserves remote data/ + env)
+./scripts/deploy.sh
 ```
 
-Proxies `/v1` + `/health`. CORS enabled on API for `:5173`.
+Docs: [`deploy/DEPLOY.md`](./deploy/DEPLOY.md)
+
+Server: `you@your-server.example` → `/var/www/beers-crawler/`  
+VPS is 1GB RAM — Playwright disabled; resolve uses **DuckDuckGo HTML** → Untappd detail via httpx.
 
 ## Next ideas
 
-1. End-to-end: serve crawler + Simulator scan → confirm scores from API
-2. Min-refresh tuning / per-beer stale UI in app
-3. History chart in web UI
-4. Auth / bind to LAN only if exposed beyond localhost
+1. E2E Simulator against production API URL
+2. History chart in web UI
+3. Larger crawl worker host if Playwright needed again
+4. Free more disk on example-host (root ~96% full)
 
 ---
 

@@ -286,24 +286,39 @@ class UntappdClient:
         assert last_err is not None
         raise last_err
 
-    async def _resolve_via_duckduckgo(self, query: str) -> list[BeerPageRef]:
-        """Lightweight resolve when Untappd search HTML is JS-only (no Playwright)."""
-        ddg = (
-            "https://html.duckduckgo.com/html/"
-            f"?q={quote_plus('site:untappd.com/b ' + query)}"
+    async def _resolve_via_external_search(self, query: str) -> list[BeerPageRef]:
+        """Lightweight resolve when Untappd search HTML is JS-only (no Playwright).
+
+        Prefer Brave (often works from VPS); fall back to DuckDuckGo HTML
+        (frequently returns HTTP 202/challenge under rate limit).
+        """
+        q = quote_plus(f"site:untappd.com/b {query}")
+        engines = (
+            ("brave", f"https://search.brave.com/search?q={q}"),
+            ("duckduckgo", f"https://html.duckduckgo.com/html/?q={q}"),
+            ("duckduckgo_lite", f"https://lite.duckduckgo.com/lite/?q={q}"),
         )
-        logger.info("DuckDuckGo fallback search for %r", query)
-        html = await self._get_html_httpx(ddg)
-        if not html:
-            return []
-        results = parse_search_results(html, query)
-        # Tag source for debugging
-        out: list[BeerPageRef] = []
-        for r in results:
-            out.append(r.model_copy(update={"source": "duckduckgo"}))
-        out.sort(key=lambda x: x.match_score, reverse=True)
-        logger.info("DuckDuckGo found %d candidates for %r", len(out), query)
-        return out
+        for name, url in engines:
+            logger.info("%s fallback search for %r", name, query)
+            html = await self._get_html_httpx(url)
+            if not html or "/b/" not in html:
+                logger.info("%s returned no Untappd beer links", name)
+                continue
+            results = parse_search_results(html, query)
+            out = [
+                r.model_copy(update={"source": f"search_{name}"}) for r in results
+            ]
+            out.sort(key=lambda x: x.match_score, reverse=True)
+            if out:
+                logger.info(
+                    "%s found %d candidates for %r (top=%.2f)",
+                    name,
+                    len(out),
+                    query,
+                    out[0].match_score,
+                )
+                return out
+        return []
 
     async def resolve_candidates(self, beer_name: str) -> list[BeerPageRef]:
         """Return all scored search candidates (best first). Updates ``last_candidates``."""
@@ -318,9 +333,9 @@ class UntappdClient:
         # If Untappd static HTML only had sidebar junk, try DuckDuckGo
         best = pick_best_candidate(results, query, self.min_match_score)
         if best is None:
-            ddg = await self._resolve_via_duckduckgo(query)
-            if ddg:
-                results = ddg
+            external = await self._resolve_via_external_search(query)
+            if external:
+                results = external
         self._last_candidates = results
         logger.info("found %d candidates for %r", len(results), query)
         return results
