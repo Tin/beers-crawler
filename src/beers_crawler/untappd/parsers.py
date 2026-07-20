@@ -171,11 +171,48 @@ def search_query_variants(query: str) -> list[str]:
     stripped = strip_style_suffixes(q0)
     if stripped and stripped.lower() != q0.lower():
         variants.append(stripped)
-    # Drop hyphenated brewery glue issues: already space-split
-    # Also try without trailing single-letter noise rarely
+
+    # Drop internal stopwords (of/the/by/and) — OCR often keeps them while
+    # Untappd beer_name uses punctuation ("Ol' Ivander" vs "Of Ivander").
+    def drop_stops(s: str) -> str:
+        parts = [
+            t
+            for t in re.split(r"\s+", s)
+            if re.sub(r"[^a-z0-9]+", "", t.lower()) not in STOP_TOKENS
+        ]
+        return " ".join(parts)
+
+    for base in list(variants):
+        ds = drop_stops(base)
+        if ds and ds.lower() != base.lower():
+            variants.append(ds)
+
+    # If query looks like "Brewery Beer…", also try beer tokens alone and
+    # "Beer Brewery" reorder (helps Algolia when brewery+name order is weak).
+    brewery, beer = split_query_hints(q0)
+    if brewery and beer:
+        # preserve order of beer tokens as they appear in query
+        ordered_beer = [
+            t
+            for t in re.split(r"[^a-z0-9]+", q0.lower())
+            if t in beer
+        ]
+        ordered_brew = [
+            t
+            for t in re.split(r"[^a-z0-9]+", q0.lower())
+            if t in brewery
+        ]
+        if ordered_beer:
+            variants.append(" ".join(ordered_beer))
+        if ordered_brew and ordered_beer:
+            variants.append(" ".join(ordered_beer + ordered_brew))
+
     seen: set[str] = set()
     out: list[str] = []
     for v in variants:
+        v = " ".join(v.split())
+        if not v:
+            continue
         key = v.lower()
         if key in seen:
             continue
@@ -248,12 +285,17 @@ def match_score(query: str, slug: str, link_text: str = "", *, in_primary_list: 
     """Score a candidate beer page against a free-text query.
 
     Higher is better. Incorporates:
-    - token overlap on slug + link text
+    - token overlap on slug + link text (style/stop tokens ignored for overlap)
     - brewery / beer-name token presence (toronado-style)
     - mega-brand penalty
     - primary list vs sidebar/nav placement
     """
-    q = _slug_tokens(query)
+    # Ignore style suffixes and stopwords when measuring overlap so
+    # "Fieldwork Of Ivander" does not match every Fieldwork "… of …" beer.
+    q_raw = _slug_tokens(strip_style_suffixes(query))
+    q = {t for t in q_raw if t not in STOP_TOKENS and t not in STYLE_SUFFIX_TOKENS}
+    if not q:
+        q = q_raw
     hay = f"{slug.replace('-', ' ')} {link_text}"
     s = _slug_tokens(hay)
     slug_l = slug.lower()
@@ -283,12 +325,18 @@ def match_score(query: str, slug: str, link_text: str = "", *, in_primary_list: 
             # Beer name alone can still win (toronado allows this)
             bonus += 0.05
         elif brewery_hit and not beer_hit:
-            overlap -= 0.15
+            # Brewery-only match without the beer name is almost always wrong
+            # (Algolia removeWordsIfNoResults returns other beers from same brewery).
+            overlap -= 0.55
         else:
             # Neither brewery nor beer name — almost certainly wrong
             overlap -= 0.5
     elif beer_tokens and not beer_hit:
         overlap -= 0.25
+
+    # Require at least one distinctive beer token when query has any
+    if distinctive_beer and not beer_hit:
+        return max(0.0, min(0.35, overlap + bonus - 0.2))
 
     # Phrase-level: beer tokens as hyphenated run in slug
     if distinctive_beer:

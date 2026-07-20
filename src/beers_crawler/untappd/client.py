@@ -369,8 +369,9 @@ class UntappdClient:
             "query": query,
             "hitsPerPage": 20,
             # Typo tolerance helps OCR noise; still rank with our scorer.
+            # Do NOT use removeWordsIfNoResults — it returns unrelated same-brewery
+            # beers when a distinctive token is missing (e.g. Ivander → random Fieldwork).
             "typoTolerance": True,
-            "removeWordsIfNoResults": "lastWords",
         }
         try:
             async with httpx.AsyncClient(timeout=self.timeout_ms / 1000.0) as client:
@@ -454,8 +455,8 @@ class UntappdClient:
             # Keep the variant that yields the strongest top match
             if not best or hits[0].match_score > best[0].match_score:
                 best = hits
-            # Good enough — stop early
-            if hits[0].match_score >= 0.75:
+            # Good enough only if beer-name tokens are present (score floor)
+            if hits[0].match_score >= 0.85:
                 break
 
         # Merge unique URLs from best list only (already best variant)

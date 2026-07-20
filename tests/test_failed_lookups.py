@@ -33,6 +33,29 @@ def test_split_firestone_walker():
     assert "walker" not in beer
 
 
+def test_match_rejects_brewery_only_fieldwork():
+    from beers_crawler.untappd.parsers import match_score
+
+    wrong = match_score(
+        "Fieldwork Of Ivander",
+        "fieldwork-brewing-company-portrait-of-bruin",
+        "Portrait of Bruin Fieldwork Brewing Company",
+    )
+    right = match_score(
+        "Fieldwork Of Ivander",
+        "fieldwork-brewing-company-ol-ivander",
+        "Ol' Ivander Fieldwork Brewing Company",
+    )
+    assert right > wrong
+    assert right >= 0.8
+    assert wrong <= 0.5
+
+
+def test_variants_drop_of_for_ivander():
+    vs = search_query_variants("Fieldwork Of Ivander")
+    assert any(v.lower() == "fieldwork ivander" for v in vs)
+
+
 def test_record_and_list_failures(tmp_path):
     db = BeerDatabase(tmp_path / "f.db")
     a = db.record_failed_lookup("Moonlight X", error="no_match")
