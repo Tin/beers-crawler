@@ -1,4 +1,4 @@
-# Session handoff — 2026-03-22
+# Session handoff — 2026-07-19
 
 **Next agent: start here, then read [`PLAN.md`](./PLAN.md).**
 

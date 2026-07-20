@@ -1,6 +1,6 @@
 # beers-crawler — plan & handoff
 
-Last updated: 2026-03-22  
+Last updated: 2026-07-19  
 Repo: `/path/to/beers-crawler` (`git@github.com:example/beers-crawler.git`)  
 Related app: `/path/to/toronado-viscosity` (iOS; in-app Untappd scrape is weak — this service is the intended backend)
 
@@ -126,7 +126,7 @@ If live crawl fails, debug with `--headed -v` and inspect search/detail HTML.
 
 ### P0 — Prove live crawl works
 
-1. ~~Run real `resolve` + `metadata` + `crawl` against Untappd.~~ **Done 2026-03-22**
+1. ~~Run real `resolve` + `metadata` + `crawl` against Untappd.~~ **Done 2026-07-19**
 2. If search HTML has no `/b/` links: Untappd may require login, bot wall, or different markup — capture HTML fixture under `tests/fixtures/` and adapt selectors in `parsers.py`. *(not needed yet)*
 3. ~~Confirm `rating_score` is non-null for at least: Pliny the Elder, Reality Czech, Sierra Nevada Pale Ale.~~ **Done** (4.49 / 3.78 / 3.62)
 4. Commit scaffold; keep `data/*.db` gitignored. (`uv.lock` currently gitignored)
@@ -211,7 +211,7 @@ beer_metadata(
 - [x] README matches actual CLI
 - [x] This PLAN updated when architecture changes
 
-### Live results snapshot (2026-03-22)
+### Live results snapshot (2026-07-19)
 
 | Query | URL slug/id | Score |
 |-------|-------------|-------|
