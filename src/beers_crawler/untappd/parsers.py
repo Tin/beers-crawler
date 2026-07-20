@@ -64,6 +64,125 @@ STOP_TOKENS = frozenset(
     }
 )
 
+# Style / form words often appended by OCR/menus but missing from Untappd beer_name.
+# "Firestone Walker Wandering Don IPA" → beer is just "Wandering Don" in the index.
+STYLE_SUFFIX_TOKENS = frozenset(
+    {
+        "ipa",
+        "dipa",
+        "ddh",
+        "neipa",
+        "hazy",
+        "pale",
+        "ale",
+        "lager",
+        "pils",
+        "pilsner",
+        "pilsener",
+        "stout",
+        "porter",
+        "sour",
+        "gose",
+        "wheat",
+        "wit",
+        "witbier",
+        "kolsch",
+        "kölsch",
+        "saison",
+        "farmhouse",
+        "barleywine",
+        "barley",
+        "wine",
+        "tripel",
+        "dubbel",
+        "quad",
+        "bock",
+        "doppelbock",
+        "helles",
+        "marzen",
+        "märzen",
+        "oktoberfest",
+        "amber",
+        "brown",
+        "red",
+        "blonde",
+        "blond",
+        "black",
+        "white",
+        "session",
+        "double",
+        "triple",
+        "imperial",
+        "nitro",
+        "draft",
+        "draught",
+        "can",
+        "bottle",
+        "pint",
+        "beer",
+    }
+)
+
+# Multi-word brewery prefixes (first N content tokens count as brewery).
+KNOWN_BREWERY_PREFIXES: tuple[tuple[str, ...], ...] = (
+    ("firestone", "walker"),
+    ("russian", "river"),
+    ("sierra", "nevada"),
+    ("dogfish", "head"),
+    ("new", "belgium"),
+    ("new", "glarus"),
+    ("bells",),
+    ("bell's",),
+    ("stone",),
+    ("lagunitas",),
+    ("deschutes",),
+    ("allagash",),
+    ("moonlight",),
+    ("fieldwork",),
+    ("odell",),
+    ("odell", "brewing"),
+)
+
+
+def strip_style_suffixes(query: str) -> str:
+    """Remove trailing style words that hurt exact-ish search engines.
+
+    Keeps at least two content tokens so we never collapse to a single word.
+    """
+    raw = [t for t in re.split(r"\s+", query.strip()) if t]
+    if len(raw) < 3:
+        return query.strip()
+    out = list(raw)
+    while len(out) >= 3:
+        last = re.sub(r"[^a-z0-9]+", "", out[-1].lower())
+        if last in STYLE_SUFFIX_TOKENS or last in STOP_TOKENS:
+            out.pop()
+            continue
+        break
+    return " ".join(out)
+
+
+def search_query_variants(query: str) -> list[str]:
+    """Ordered unique query strings to try against search backends."""
+    q0 = " ".join(query.split())
+    if not q0:
+        return []
+    variants: list[str] = [q0]
+    stripped = strip_style_suffixes(q0)
+    if stripped and stripped.lower() != q0.lower():
+        variants.append(stripped)
+    # Drop hyphenated brewery glue issues: already space-split
+    # Also try without trailing single-letter noise rarely
+    seen: set[str] = set()
+    out: list[str] = []
+    for v in variants:
+        key = v.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(v)
+    return out
+
 
 def normalize_beer_url(url: str) -> Optional[str]:
     m = BEER_PATH_RE.search(url)
@@ -86,30 +205,38 @@ def _normalized_phrase(text: str) -> str:
 def split_query_hints(query: str) -> tuple[set[str], set[str]]:
     """Heuristic split of free-text query into brewery-ish vs beer-name tokens.
 
-    Untappd queries are usually ``\"Brewery Beer Name\"``. Prefer a **single**
-    leading token as brewery for short queries so multi-word beer names keep
-    distinctive tokens (e.g. ``Moonlight Bombay by Boat`` → brewery={moonlight},
-    beer={bombay, boat}). Longer classic forms like ``Russian River Pliny the
-    Elder`` still treat the first two content tokens as brewery when ≥5 tokens.
+    Untappd queries are usually ``\"Brewery Beer Name\"``. Known two-word
+    breweries (Firestone Walker, Russian River, …) take priority so beer-name
+    tokens stay intact. Otherwise prefer a single leading brewery token for
+    short queries (``Moonlight Bombay by Boat``).
     """
-    raw = [t for t in re.split(r"[^a-z0-9]+", query.lower()) if t]
+    # Score/match should ignore trailing style suffixes
+    q = strip_style_suffixes(query)
+    raw = [t for t in re.split(r"[^a-z0-9]+", q.lower()) if t]
     content = [t for t in raw if t not in STOP_TOKENS and len(t) >= 2]
     if not content:
         return set(), set(raw)
 
-    # Single-token or two-token beer-only queries
     if len(content) <= 2:
         return set(), set(content)
 
-    # ≥5 content tokens: likely "Two Word Brewery + beer…"
-    # e.g. russian river pliny the elder → content without stop: russian,river,pliny,elder (4)
-    # with elder+extra style words can be 5+. Use 2-token brewery only when enough left.
+    # Known multi-word brewery at start
+    for prefix in KNOWN_BREWERY_PREFIXES:
+        pref = [p for p in prefix if p not in STOP_TOKENS and len(p) >= 2]
+        if not pref:
+            continue
+        n = len(pref)
+        if content[:n] == list(pref) and len(content) > n:
+            brewery = set(pref)
+            beer = set(content[n:])
+            beer = {t for t in beer if t not in STOP_TOKENS} or set(content[n:])
+            return brewery, beer
+
+    # ≥5 content tokens: two-word brewery guess
     if len(content) >= 5:
         brewery = set(content[:2])
         beer = set(content[2:])
     else:
-        # 3–4 tokens: first token brewery, rest beer name
-        # Moonlight Bombay Boat → brewery={moonlight}, beer={bombay,boat}
         brewery = {content[0]}
         beer = set(content[1:])
 

@@ -16,6 +16,7 @@ from beers_crawler.untappd.parsers import (
     normalize_beer_url,
     parse_beer_page,
     parse_search_results,
+    search_query_variants,
     split_query_hints,
 )
 
@@ -346,14 +347,13 @@ class UntappdClient:
         )
         return self._algolia_cfg
 
-    async def _resolve_via_algolia(self, query: str) -> list[BeerPageRef]:
-        """Query Untappd's public Algolia beer index (same backend as site search UI).
-
-        Works without Playwright and without third-party search engines.
-        """
-        cfg = await self._fetch_untappd_search_config()
-        if not cfg:
-            return []
+    async def _algolia_query_once(
+        self,
+        *,
+        cfg: dict[str, str],
+        query: str,
+        original_query: str,
+    ) -> list[BeerPageRef]:
         app_id = cfg["app_id"]
         api_key = cfg["api_key"]
         index = cfg["index"]
@@ -365,7 +365,13 @@ class UntappdClient:
             "User-Agent": USER_AGENT,
             "Accept": "application/json",
         }
-        payload: dict[str, Any] = {"query": query, "hitsPerPage": 20}
+        payload: dict[str, Any] = {
+            "query": query,
+            "hitsPerPage": 20,
+            # Typo tolerance helps OCR noise; still rank with our scorer.
+            "typoTolerance": True,
+            "removeWordsIfNoResults": "lastWords",
+        }
         try:
             async with httpx.AsyncClient(timeout=self.timeout_ms / 1000.0) as client:
                 resp = await client.post(url, headers=headers, json=payload)
@@ -388,7 +394,6 @@ class UntappdClient:
             if not bid:
                 continue
             if not slug:
-                # Fallback from beer_index text
                 idx = str(hit.get("beer_index") or hit.get("beer_name") or "")
                 slug = re.sub(r"[^a-z0-9]+", "-", idx.lower()).strip("-") or "beer"
             page_url = f"https://untappd.com/b/{slug}/{bid}"
@@ -401,13 +406,17 @@ class UntappdClient:
                     hit.get("beer_name"),
                     hit.get("brewery_name"),
                     hit.get("beer_index"),
+                    hit.get("type_name"),
                 )
                 if x
             )
-            score = match_score(query, str(slug), link_text, in_primary_list=True)
+            # Score against the original user query (with styles), not only variant.
+            score = match_score(
+                original_query, str(slug), link_text, in_primary_list=True
+            )
             results.append(
                 BeerPageRef(
-                    query=query,
+                    query=original_query,
                     page_url=page_url,
                     slug=str(slug),
                     beer_id=str(bid),
@@ -416,13 +425,47 @@ class UntappdClient:
                 )
             )
         results.sort(key=lambda r: r.match_score, reverse=True)
+        return results
+
+    async def _resolve_via_algolia(self, query: str) -> list[BeerPageRef]:
+        """Query Untappd's public Algolia beer index (same backend as site search UI).
+
+        Tries query variants (strip trailing IPA/style words) because Algolia often
+        returns zero hits when menus append a style not present in beer_name
+        (e.g. "Wandering Don IPA" vs beer_name "Wandering Don").
+        """
+        cfg = await self._fetch_untappd_search_config()
+        if not cfg:
+            return []
+
+        best: list[BeerPageRef] = []
+        for variant in search_query_variants(query):
+            hits = await self._algolia_query_once(
+                cfg=cfg, query=variant, original_query=query
+            )
+            logger.info(
+                "Algolia variant %r → %d hits (top=%s)",
+                variant,
+                len(hits),
+                f"{hits[0].match_score:.2f}" if hits else "n/a",
+            )
+            if not hits:
+                continue
+            # Keep the variant that yields the strongest top match
+            if not best or hits[0].match_score > best[0].match_score:
+                best = hits
+            # Good enough — stop early
+            if hits[0].match_score >= 0.75:
+                break
+
+        # Merge unique URLs from best list only (already best variant)
         logger.info(
             "Algolia found %d candidates for %r (top=%s)",
-            len(results),
+            len(best),
             query,
-            f"{results[0].match_score:.2f}" if results else "n/a",
+            f"{best[0].match_score:.2f}" if best else "n/a",
         )
-        return results
+        return best
 
     async def _resolve_via_external_search(self, query: str) -> list[BeerPageRef]:
         """Third-party HTML search when Algolia is unavailable."""

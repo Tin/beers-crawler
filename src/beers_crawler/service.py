@@ -109,11 +109,13 @@ class CrawlerService:
                 )
                 return fresh
 
+        error: str | None = None
         try:
             ref = await self.client.resolve_page(beer_name)
-        except Exception:
+        except Exception as exc:
             logger.exception("live resolve failed for %r", beer_name)
             ref = None
+            error = f"{type(exc).__name__}: {exc}"
 
         candidates = self.client.last_candidates
         # Only persist candidates that clear the match floor (avoid sidebar junk)
@@ -142,7 +144,29 @@ class CrawlerService:
                     beer_name,
                     cached.match_score,
                 )
+
+        # Self-learning: remember misses for later research
+        summary = self._candidate_summary(candidates)
+        try:
+            self.db.record_failed_lookup(
+                beer_name,
+                error=error or "no_match",
+                candidate_summary=summary,
+            )
+        except Exception:
+            logger.exception("failed to record failed_lookup for %r", beer_name)
         return None
+
+    @staticmethod
+    def _candidate_summary(candidates: list, *, limit: int = 8) -> str | None:
+        if not candidates:
+            return None
+        parts: list[str] = []
+        for c in candidates[:limit]:
+            parts.append(
+                f"{getattr(c, 'match_score', 0):.2f}|{getattr(c, 'source', '')}|{getattr(c, 'page_url', '')}"
+            )
+        return "\n".join(parts)
 
     async def beer_name_to_candidates(
         self,

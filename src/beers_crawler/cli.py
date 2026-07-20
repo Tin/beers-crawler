@@ -681,6 +681,49 @@ def export_cmd(
         click.echo(text, nl=not text.endswith("\n"))
 
 
+@main.command("failures")
+@_db_option
+@click.option(
+    "--status",
+    default="open",
+    show_default=True,
+    help="open | researching | resolved | ignored | all",
+)
+@click.option("--limit", default=50, show_default=True, type=int)
+@click.option("--json", "as_json", is_flag=True)
+def failures_cmd(
+    db_path: Optional[Path], status: str, limit: int, as_json: bool
+) -> None:
+    """List beer names the crawler failed to resolve (self-learning queue)."""
+    db = BeerDatabase(db_path)
+    st = None if status == "all" else status
+    rows = db.list_failed_lookups(status=st, limit=limit)
+    if as_json:
+        console.print_json(json.dumps([r.model_dump(mode="json") for r in rows]))
+        return
+    if not rows:
+        console.print("[green]No failed lookups[/green]", db.failed_lookup_stats())
+        return
+    table = Table(title=f"Failed lookups ({db.path})")
+    table.add_column("ID", justify="right")
+    table.add_column("N", justify="right")
+    table.add_column("Status")
+    table.add_column("Last failed")
+    table.add_column("Query")
+    table.add_column("Error")
+    for r in rows:
+        table.add_row(
+            str(r.id),
+            str(r.fail_count),
+            r.status,
+            r.last_failed_at.strftime("%Y-%m-%d %H:%M") if r.last_failed_at else "—",
+            r.query,
+            (r.last_error or "—")[:40],
+        )
+    console.print(table)
+    console.print(db.failed_lookup_stats())
+
+
 @main.command("serve")
 @click.option("--host", default="127.0.0.1", show_default=True)
 @click.option("--port", default=8741, show_default=True, type=int)

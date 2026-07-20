@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator, Optional
 
-from beers_crawler.models import BeerMetadata, BeerPageRef, utc_now
+from beers_crawler.models import BeerMetadata, BeerPageRef, FailedLookup, utc_now
 
 # beer_metadata is append-only history (many rows per page_url over time).
 # beer_pages keeps latest candidates per (query, page_url) for resolve debug.
@@ -55,6 +55,28 @@ CREATE TABLE IF NOT EXISTS api_users (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+
+-- Failed name→URL resolves for self-learning / research queue.
+CREATE TABLE IF NOT EXISTS failed_lookups (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    query TEXT NOT NULL,
+    normalized_query TEXT NOT NULL UNIQUE,
+    fail_count INTEGER NOT NULL DEFAULT 1,
+    last_error TEXT,
+    candidate_summary TEXT,
+    first_failed_at TEXT NOT NULL,
+    last_failed_at TEXT NOT NULL,
+    resolved_page_url TEXT,
+    resolved_at TEXT,
+    resolved_by TEXT,
+    notes TEXT,
+    status TEXT NOT NULL DEFAULT 'open'
+);
+
+CREATE INDEX IF NOT EXISTS idx_failed_lookups_status_time
+    ON failed_lookups(status, last_failed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_failed_lookups_count
+    ON failed_lookups(fail_count DESC);
 """
 
 
@@ -92,7 +114,7 @@ class BeerDatabase:
         with self._connect() as conn:
             conn.executescript(SCHEMA)
             self._migrate_metadata_unique(conn)
-            # Ensure users table exists even on DBs created before auth
+            # Ensure tables exist even on DBs created before auth / failed-lookup features
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS api_users (
@@ -101,6 +123,25 @@ class BeerDatabase:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS failed_lookups (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    query TEXT NOT NULL,
+                    normalized_query TEXT NOT NULL UNIQUE,
+                    fail_count INTEGER NOT NULL DEFAULT 1,
+                    last_error TEXT,
+                    candidate_summary TEXT,
+                    first_failed_at TEXT NOT NULL,
+                    last_failed_at TEXT NOT NULL,
+                    resolved_page_url TEXT,
+                    resolved_at TEXT,
+                    resolved_by TEXT,
+                    notes TEXT,
+                    status TEXT NOT NULL DEFAULT 'open'
+                );
+                CREATE INDEX IF NOT EXISTS idx_failed_lookups_status_time
+                    ON failed_lookups(status, last_failed_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_failed_lookups_count
+                    ON failed_lookups(fail_count DESC);
                 """
             )
 
@@ -443,3 +484,171 @@ class BeerDatabase:
                 ]
             )
         return buf.getvalue()
+
+    @staticmethod
+    def normalize_lookup_query(query: str) -> str:
+        return " ".join(query.strip().lower().split())
+
+    def _row_to_failed_lookup(self, row: sqlite3.Row) -> FailedLookup:
+        return FailedLookup(
+            id=int(row["id"]),
+            query=row["query"],
+            normalized_query=row["normalized_query"],
+            fail_count=int(row["fail_count"] or 1),
+            last_error=row["last_error"],
+            candidate_summary=row["candidate_summary"],
+            first_failed_at=_parse_dt(row["first_failed_at"]),
+            last_failed_at=_parse_dt(row["last_failed_at"]),
+            resolved_page_url=row["resolved_page_url"],
+            resolved_at=_parse_dt(row["resolved_at"]) if row["resolved_at"] else None,
+            resolved_by=row["resolved_by"],
+            notes=row["notes"],
+            status=row["status"] or "open",
+        )
+
+    def record_failed_lookup(
+        self,
+        query: str,
+        *,
+        error: str | None = None,
+        candidate_summary: str | None = None,
+    ) -> FailedLookup:
+        """Upsert a failed resolve; increments fail_count for open items."""
+        now = utc_now().isoformat()
+        norm = self.normalize_lookup_query(query)
+        original = query.strip()
+        with self.connection() as conn:
+            existing = conn.execute(
+                "SELECT * FROM failed_lookups WHERE normalized_query = ?",
+                (norm,),
+            ).fetchone()
+            if existing is None:
+                cur = conn.execute(
+                    """
+                    INSERT INTO failed_lookups (
+                        query, normalized_query, fail_count, last_error,
+                        candidate_summary, first_failed_at, last_failed_at, status
+                    ) VALUES (?, ?, 1, ?, ?, ?, ?, 'open')
+                    """,
+                    (original, norm, error, candidate_summary, now, now),
+                )
+                row_id = int(cur.lastrowid)
+            else:
+                # Re-open if previously resolved/ignored and it failed again
+                status = existing["status"] or "open"
+                if status in {"resolved", "ignored"}:
+                    status = "open"
+                conn.execute(
+                    """
+                    UPDATE failed_lookups SET
+                        query = ?,
+                        fail_count = fail_count + 1,
+                        last_error = ?,
+                        candidate_summary = COALESCE(?, candidate_summary),
+                        last_failed_at = ?,
+                        status = ?,
+                        resolved_page_url = CASE WHEN ? = 'open' THEN NULL ELSE resolved_page_url END,
+                        resolved_at = CASE WHEN ? = 'open' THEN NULL ELSE resolved_at END
+                    WHERE normalized_query = ?
+                    """,
+                    (
+                        original,
+                        error,
+                        candidate_summary,
+                        now,
+                        status,
+                        status,
+                        status,
+                        norm,
+                    ),
+                )
+                row_id = int(existing["id"])
+            row = conn.execute(
+                "SELECT * FROM failed_lookups WHERE id = ?", (row_id,)
+            ).fetchone()
+        assert row is not None
+        return self._row_to_failed_lookup(row)
+
+    def list_failed_lookups(
+        self,
+        *,
+        status: str | None = "open",
+        limit: int = 50,
+        min_fail_count: int = 1,
+    ) -> list[FailedLookup]:
+        sql = "SELECT * FROM failed_lookups WHERE fail_count >= ?"
+        params: list[object] = [min_fail_count]
+        if status:
+            sql += " AND status = ?"
+            params.append(status)
+        sql += " ORDER BY fail_count DESC, last_failed_at DESC LIMIT ?"
+        params.append(limit)
+        with self.connection() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [self._row_to_failed_lookup(r) for r in rows]
+
+    def get_failed_lookup(self, lookup_id: int) -> Optional[FailedLookup]:
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM failed_lookups WHERE id = ?", (lookup_id,)
+            ).fetchone()
+        return self._row_to_failed_lookup(row) if row else None
+
+    def mark_failed_lookup_resolved(
+        self,
+        lookup_id: int,
+        *,
+        page_url: str,
+        resolved_by: str = "manual",
+        notes: str | None = None,
+    ) -> Optional[FailedLookup]:
+        now = utc_now().isoformat()
+        with self.connection() as conn:
+            conn.execute(
+                """
+                UPDATE failed_lookups SET
+                    status = 'resolved',
+                    resolved_page_url = ?,
+                    resolved_at = ?,
+                    resolved_by = ?,
+                    notes = COALESCE(?, notes)
+                WHERE id = ?
+                """,
+                (page_url, now, resolved_by, notes, lookup_id),
+            )
+        return self.get_failed_lookup(lookup_id)
+
+    def mark_failed_lookup_status(
+        self,
+        lookup_id: int,
+        status: str,
+        *,
+        notes: str | None = None,
+    ) -> Optional[FailedLookup]:
+        if status not in {"open", "researching", "resolved", "ignored"}:
+            raise ValueError(f"invalid status: {status}")
+        with self.connection() as conn:
+            conn.execute(
+                """
+                UPDATE failed_lookups SET
+                    status = ?,
+                    notes = COALESCE(?, notes)
+                WHERE id = ?
+                """,
+                (status, notes, lookup_id),
+            )
+        return self.get_failed_lookup(lookup_id)
+
+    def failed_lookup_stats(self) -> dict[str, int]:
+        with self.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT status, COUNT(*) AS n FROM failed_lookups GROUP BY status
+                """
+            ).fetchall()
+            total = conn.execute(
+                "SELECT COUNT(*) AS n FROM failed_lookups"
+            ).fetchone()["n"]
+        out = {str(r["status"]): int(r["n"]) for r in rows}
+        out["total"] = int(total)
+        return out

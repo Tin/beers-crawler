@@ -46,3 +46,24 @@ class BeerMetadata(BaseModel):
     history_id: Optional[int] = Field(
         default=None, description="SQLite row id when loaded from history"
     )
+
+
+class FailedLookup(BaseModel):
+    """A beer name resolve/crawl that returned no usable Untappd page."""
+
+    id: Optional[int] = None
+    query: str
+    normalized_query: str
+    fail_count: int = 1
+    last_error: Optional[str] = None
+    candidate_summary: Optional[str] = None
+    first_failed_at: datetime = Field(default_factory=utc_now)
+    last_failed_at: datetime = Field(default_factory=utc_now)
+    resolved_page_url: Optional[str] = None
+    resolved_at: Optional[datetime] = None
+    resolved_by: Optional[str] = None
+    notes: Optional[str] = None
+    status: str = Field(
+        default="open",
+        description="open | researching | resolved | ignored",
+    )

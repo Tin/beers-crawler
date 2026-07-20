@@ -24,7 +24,7 @@ from pydantic import BaseModel, Field
 from beers_crawler import __version__
 from beers_crawler.auth import get_auth_config, init_auth, require_auth, reset_auth_cache
 from beers_crawler.db import BeerDatabase, default_db_path
-from beers_crawler.models import BeerMetadata, BeerPageRef
+from beers_crawler.models import BeerMetadata, BeerPageRef, FailedLookup
 from beers_crawler.service import DEFAULT_MIN_REFRESH_SECONDS, CrawlerService
 from beers_crawler.untappd.client import UntappdClient
 
@@ -46,6 +46,17 @@ class CrawlRequest(BaseModel):
 class CrawlResponse(BaseModel):
     page: Optional[BeerPageRef] = None
     metadata: Optional[BeerMetadata] = None
+
+
+class ResolveFailureBody(BaseModel):
+    page_url: str = Field(..., min_length=8, description="Correct Untappd /b/… URL")
+    resolved_by: str = Field(default="manual", max_length=64)
+    notes: Optional[str] = None
+
+
+class FailureStatusBody(BaseModel):
+    status: str = Field(..., description="open | researching | ignored")
+    notes: Optional[str] = None
 
 
 class HealthResponse(BaseModel):
@@ -292,3 +303,96 @@ async def list_cached(
     if db is None:
         raise HTTPException(status_code=503, detail="db not ready")
     return db.list_metadata(limit=limit)
+
+
+@app.get("/v1/failures", response_model=list[FailedLookup])
+async def list_failures(
+    _: AuthUser,
+    status: Optional[str] = Query(
+        "open",
+        description="Filter: open | researching | resolved | ignored | all",
+    ),
+    limit: int = Query(50, ge=1, le=500),
+    min_fail_count: int = Query(1, ge=1),
+) -> list[FailedLookup]:
+    """Beer names the crawler could not resolve (self-learning queue)."""
+    db = state.db
+    if db is None:
+        raise HTTPException(status_code=503, detail="db not ready")
+    st = None if status in (None, "", "all") else status
+    return db.list_failed_lookups(status=st, limit=limit, min_fail_count=min_fail_count)
+
+
+@app.get("/v1/failures/stats")
+async def failures_stats(_: AuthUser) -> dict[str, int]:
+    db = state.db
+    if db is None:
+        raise HTTPException(status_code=503, detail="db not ready")
+    return db.failed_lookup_stats()
+
+
+@app.get("/v1/failures/{lookup_id}", response_model=FailedLookup)
+async def get_failure(_: AuthUser, lookup_id: int) -> FailedLookup:
+    db = state.db
+    if db is None:
+        raise HTTPException(status_code=503, detail="db not ready")
+    row = db.get_failed_lookup(lookup_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="failure not found")
+    return row
+
+
+@app.post("/v1/failures/{lookup_id}/resolve", response_model=FailedLookup)
+async def resolve_failure(
+    _: AuthUser, lookup_id: int, body: ResolveFailureBody
+) -> FailedLookup:
+    """Mark a failed lookup resolved with the correct Untappd URL (for learning)."""
+    db = state.db
+    if db is None:
+        raise HTTPException(status_code=503, detail="db not ready")
+    if db.get_failed_lookup(lookup_id) is None:
+        raise HTTPException(status_code=404, detail="failure not found")
+    # Also seed page_ref so future crawls can use history
+    from beers_crawler.models import BeerPageRef
+    from beers_crawler.untappd.parsers import BEER_PATH_RE, normalize_beer_url
+
+    url = normalize_beer_url(body.page_url) or body.page_url.strip()
+    m = BEER_PATH_RE.search(url)
+    fail = db.get_failed_lookup(lookup_id)
+    assert fail is not None
+    db.save_page_ref(
+        BeerPageRef(
+            query=fail.query,
+            page_url=url,
+            slug=m.group(1) if m else None,
+            beer_id=m.group(2) if m else None,
+            match_score=1.0,
+            source=f"manual:{body.resolved_by}",
+        )
+    )
+    row = db.mark_failed_lookup_resolved(
+        lookup_id,
+        page_url=url,
+        resolved_by=body.resolved_by,
+        notes=body.notes,
+    )
+    assert row is not None
+    return row
+
+
+@app.patch("/v1/failures/{lookup_id}", response_model=FailedLookup)
+async def patch_failure(
+    _: AuthUser, lookup_id: int, body: FailureStatusBody
+) -> FailedLookup:
+    db = state.db
+    if db is None:
+        raise HTTPException(status_code=503, detail="db not ready")
+    try:
+        row = db.mark_failed_lookup_status(
+            lookup_id, body.status, notes=body.notes
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if row is None:
+        raise HTTPException(status_code=404, detail="failure not found")
+    return row
