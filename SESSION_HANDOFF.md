@@ -47,7 +47,7 @@ iOS / web UI
 ## Bootstrap
 
 ```bash
-cd /path/to/beers-crawler   # or your clone path
+cd /path/to/beers-crawler
 uv sync && uv run playwright install chromium
 uv run pytest -q
 uv run beers-crawler serve --port 8741

@@ -1,8 +1,8 @@
 # beers-crawler — plan & handoff
 
 Last updated: 2026-07-19 (evening)  
-Repo: `/path/to/beers-crawler` (`git@github.com:example/beers-crawler.git`)  
-Related app: `/path/to/toronado-viscosity` (iOS; in-app Untappd scrape is weak — this service is the intended backend)
+Repo: `beers-crawler`  
+Related app: Toronado Viscosity (iOS; in-app Untappd scrape is weak — this service is the intended backend)
 
 ---
 
