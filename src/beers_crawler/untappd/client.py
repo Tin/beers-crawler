@@ -25,21 +25,44 @@ USER_AGENT = (
 
 
 def pick_best_candidate(
-    candidates: list[BeerPageRef], query: str, min_score: float = 0.25
+    candidates: list[BeerPageRef], query: str, min_score: float = 0.4
 ) -> Optional[BeerPageRef]:
     """Select best candidate from a scored list (same rules as ``best_search_result``)."""
     if not candidates:
         return None
-    top = candidates[0]
+
+    list_hits = [c for c in candidates if c.source == "untappd_search_list"]
+    pool = list_hits if list_hits else candidates
+    top = pool[0]
     if top.match_score < min_score:
         return None
+
+    if not list_hits and top.source in {
+        "untappd_search",
+        "untappd_search_sidebar",
+        "untappd_search_raw",
+    }:
+        slug_l = (top.slug or "").lower()
+        mega = (
+            "guinness",
+            "corona",
+            "heineken",
+            "stella",
+            "modelo",
+            "budweiser",
+            "michelob",
+            "coors",
+            "miller",
+        )
+        if any(b in slug_l for b in mega) and top.match_score < 0.6:
+            return None
 
     brewery_tokens, beer_tokens = split_query_hints(query)
     distinctive_beer = {t for t in beer_tokens if len(t) >= 3}
     if brewery_tokens and distinctive_beer:
         hay = f"{top.slug or ''} {top.page_url}".lower()
         if not any(t in hay for t in distinctive_beer):
-            for cand in candidates[1:]:
+            for cand in pool[1:]:
                 if cand.match_score < min_score:
                     break
                 hay_c = f"{cand.slug or ''} {cand.page_url}".lower()
@@ -64,7 +87,7 @@ class UntappdClient:
         *,
         headless: bool = True,
         timeout_ms: int = 30_000,
-        min_match_score: float = 0.25,
+        min_match_score: float = 0.4,
         prefer_httpx: bool = False,
         max_retries: int = 2,
         allow_playwright: bool = True,
@@ -113,8 +136,32 @@ class UntappdClient:
         from playwright.async_api import async_playwright
 
         try:
+            import os
+            from pathlib import Path
+
+            # On small VPS we may only have full chromium, not headless_shell.
+            os.environ.setdefault("PLAYWRIGHT_CHROMIUM_USE_HEADLESS_SHELL", "0")
+
             self._playwright = await async_playwright().start()
-            self._browser = await self._playwright.chromium.launch(headless=self.headless)
+            launch_kwargs: dict = {"headless": self.headless}
+            exe = os.environ.get("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH")
+            if not exe:
+                # Common cache layout after `playwright install chromium`
+                cache = Path(
+                    os.environ.get(
+                        "PLAYWRIGHT_BROWSERS_PATH",
+                        Path.home() / ".cache" / "ms-playwright",
+                    )
+                )
+                for candidate in sorted(cache.glob("chromium-*/chrome-linux*/chrome")):
+                    if candidate.is_file():
+                        exe = str(candidate)
+                        break
+            if exe:
+                launch_kwargs["executable_path"] = exe
+                logger.info("Playwright using executable_path=%s", exe)
+
+            self._browser = await self._playwright.chromium.launch(**launch_kwargs)
             self._context = await self._browser.new_context(
                 user_agent=USER_AGENT,
                 locale="en-US",
@@ -178,6 +225,28 @@ class UntappdClient:
         finally:
             await page.close()
 
+    @staticmethod
+    def _static_html_is_usable(url: str, html: str) -> bool:
+        """Return True if static HTML is good enough (skip Playwright).
+
+        Untappd search without JS usually only has sidebar featured brands
+        (no ``div.beer-item``). Beer detail pages often have JSON-LD.
+        """
+        if not html:
+            return False
+        low = html.lower()
+        is_search = "/search" in url.lower()
+        if is_search:
+            # Real beer search results render as beer-item cards.
+            # Empty shells often still include result-list / results-container markup.
+            return "beer-item" in low
+        # Detail page: JSON-LD rating or h1 name is enough
+        if "application/ld+json" in low and "ratingvalue" in low:
+            return True
+        if "/b/" in url and ("rating_score" in low or 'class="num"' in low or "<h1" in low):
+            return True
+        return "/b/" in low
+
     async def _get_html(self, url: str, *, wait_selector: Optional[str] = None) -> str:
         last_err: Optional[Exception] = None
         attempts = max(1, self.max_retries + 1)
@@ -185,13 +254,22 @@ class UntappdClient:
             try:
                 if self.prefer_httpx or not self.allow_playwright:
                     html = await self._get_html_httpx(url)
-                    if html:
+                    if html and self._static_html_is_usable(url, html):
                         return html
+                    if html:
+                        logger.info(
+                            "httpx HTML incomplete for %s (len=%d); Playwright=%s",
+                            url,
+                            len(html),
+                            self.allow_playwright and not self._playwright_failed,
+                        )
                     if not self.allow_playwright or self._playwright_failed:
+                        if html:
+                            return html
                         raise RuntimeError(
                             f"httpx returned no beer HTML for {url} and Playwright is unavailable"
                         )
-                    logger.info("httpx miss for %s; falling back to Playwright", url)
+                    logger.info("falling back to Playwright for %s", url)
                 return await self._get_html_playwright(url, wait_selector=wait_selector)
             except Exception as exc:
                 last_err = exc
@@ -208,6 +286,25 @@ class UntappdClient:
         assert last_err is not None
         raise last_err
 
+    async def _resolve_via_duckduckgo(self, query: str) -> list[BeerPageRef]:
+        """Lightweight resolve when Untappd search HTML is JS-only (no Playwright)."""
+        ddg = (
+            "https://html.duckduckgo.com/html/"
+            f"?q={quote_plus('site:untappd.com/b ' + query)}"
+        )
+        logger.info("DuckDuckGo fallback search for %r", query)
+        html = await self._get_html_httpx(ddg)
+        if not html:
+            return []
+        results = parse_search_results(html, query)
+        # Tag source for debugging
+        out: list[BeerPageRef] = []
+        for r in results:
+            out.append(r.model_copy(update={"source": "duckduckgo"}))
+        out.sort(key=lambda x: x.match_score, reverse=True)
+        logger.info("DuckDuckGo found %d candidates for %r", len(out), query)
+        return out
+
     async def resolve_candidates(self, beer_name: str) -> list[BeerPageRef]:
         """Return all scored search candidates (best first). Updates ``last_candidates``."""
         query = beer_name.strip()
@@ -218,6 +315,12 @@ class UntappdClient:
         logger.info("searching Untappd for %r → %s", query, search_url)
         html = await self._get_html(search_url, wait_selector="a[href*='/b/']")
         results = parse_search_results(html, query)
+        # If Untappd static HTML only had sidebar junk, try DuckDuckGo
+        best = pick_best_candidate(results, query, self.min_match_score)
+        if best is None:
+            ddg = await self._resolve_via_duckduckgo(query)
+            if ddg:
+                results = ddg
         self._last_candidates = results
         logger.info("found %d candidates for %r", len(results), query)
         return results

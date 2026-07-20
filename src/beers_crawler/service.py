@@ -116,9 +116,12 @@ class CrawlerService:
             ref = None
 
         candidates = self.client.last_candidates
-        if hist and candidates:
-            self.db.save_page_refs(candidates)
-        elif hist and ref is not None:
+        # Only persist candidates that clear the match floor (avoid sidebar junk)
+        min_score = getattr(self.client, "min_match_score", 0.25)
+        good = [c for c in candidates if c.match_score >= min_score]
+        if hist and good:
+            self.db.save_page_refs(good)
+        elif hist and ref is not None and ref.match_score >= min_score:
             self.db.save_page_ref(ref)
 
         if ref is not None:
@@ -126,13 +129,19 @@ class CrawlerService:
 
         if hist:
             cached = self.db.get_page_ref(beer_name)
-            if cached is not None:
+            if cached is not None and cached.match_score >= min_score:
                 logger.info(
                     "history fallback page_ref for %r → %s",
                     beer_name,
                     cached.page_url,
                 )
                 return cached
+            if cached is not None:
+                logger.info(
+                    "ignoring weak history page_ref for %r score=%.2f",
+                    beer_name,
+                    cached.match_score,
+                )
         return None
 
     async def beer_name_to_candidates(

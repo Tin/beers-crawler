@@ -367,14 +367,26 @@ def parse_search_results(html: str, query: str) -> list[BeerPageRef]:
 
 
 def best_search_result(
-    html: str, query: str, min_score: float = 0.25
+    html: str, query: str, min_score: float = 0.4
 ) -> Optional[BeerPageRef]:
     results = parse_search_results(html, query)
     if not results:
         return None
-    top = results[0]
+
+    # Prefer real search-list hits over sidebar/nav featured brands.
+    # Static httpx HTML often has only sidebar links — reject weak ones.
+    list_hits = [r for r in results if r.source == "untappd_search_list"]
+    pool = list_hits if list_hits else results
+
+    top = pool[0]
     if top.match_score < min_score:
         return None
+
+    # Sidebar-only mega-brand with middling score is almost never right
+    if not list_hits and top.source in {"untappd_search", "untappd_search_sidebar", "untappd_search_raw"}:
+        slug_l = (top.slug or "").lower()
+        if any(b in slug_l for b in MEGA_BRANDS) and top.match_score < 0.6:
+            return None
 
     # When query looks like "Brewery + Beer", require beer token in winner
     brewery_tokens, beer_tokens = split_query_hints(query)
@@ -383,7 +395,7 @@ def best_search_result(
         hay = f"{top.slug or ''} {top.page_url}".lower()
         if not any(t in hay for t in distinctive_beer):
             # try next candidates that satisfy beer token
-            for cand in results[1:]:
+            for cand in pool[1:]:
                 if cand.match_score < min_score:
                     break
                 hay_c = f"{cand.slug or ''} {cand.page_url}".lower()

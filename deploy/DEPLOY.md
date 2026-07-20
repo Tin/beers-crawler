@@ -102,7 +102,13 @@ BEERS_CRAWLER_MIN_REFRESH_SECONDS=21600
 BEERS_CRAWLER_CORS=https://www.example.com,https://example.com
 ```
 
-`PREFER_HTTPX=1` avoids Playwright Chromium on this 1 GB VPS. Set to `0` and run `uv run playwright install chromium` only if static HTML fails.
+On this **1 GB VPS**, production uses:
+
+- `PREFER_HTTPX=1` + `ALLOW_PLAYWRIGHT=0` (Chromium OOMs / missing headless_shell)
+- **DuckDuckGo HTML** fallback to resolve Untappd `/b/` URLs when Untappd search is JS-only
+- Beer **detail** pages usually work with plain httpx (JSON-LD ratings)
+
+Optional later: move crawl workers to a larger host and set `ALLOW_PLAYWRIGHT=1`.
 
 ---
 
