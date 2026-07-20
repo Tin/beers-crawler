@@ -1,0 +1,36 @@
+[project]
+name = "beers-crawler"
+version = "0.1.0"
+description = "CLI crawler for Untappd beer pages and ratings (SQLite-backed)"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "beautifulsoup4>=4.12",
+    "click>=8.1",
+    "httpx>=0.27",
+    "lxml>=5.0",
+    "playwright>=1.49",
+    "pydantic>=2.0",
+    "rich>=13.0",
+]
+
+[project.scripts]
+beers-crawler = "beers_crawler.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/beers_crawler"]
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["src"]

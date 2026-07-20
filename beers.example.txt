@@ -1,0 +1,4 @@
+# One beer name per line for: uv run beers-crawler batch beers.example.txt
+Russian River Pliny the Elder
+Moonlight Reality Czech
+Sierra Nevada Pale Ale
