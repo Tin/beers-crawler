@@ -67,16 +67,20 @@ class UntappdClient:
         min_match_score: float = 0.25,
         prefer_httpx: bool = False,
         max_retries: int = 2,
+        allow_playwright: bool = True,
     ) -> None:
         self.headless = headless
         self.timeout_ms = timeout_ms
         self.min_match_score = min_match_score
         self.prefer_httpx = prefer_httpx
+        # When False, never launch Chromium (low-memory hosts / httpx-only).
+        self.allow_playwright = allow_playwright
         self.max_retries = max_retries
         self._playwright = None
         self._browser = None
         self._context = None
         self._last_candidates: list[BeerPageRef] = []
+        self._playwright_failed = False
 
     @property
     def last_candidates(self) -> list[BeerPageRef]:
@@ -91,18 +95,37 @@ class UntappdClient:
         await self.close()
 
     async def start(self) -> None:
+        """Eager Playwright start (optional). Safe no-op when Playwright is disabled."""
+        if not self.allow_playwright:
+            logger.info("Playwright disabled (httpx-only mode)")
+            return
+        if self.prefer_httpx:
+            # Lazy-start browser only if httpx misses — saves RAM on small VPS.
+            logger.info("Playwright deferred until httpx miss")
+            return
+        await self._ensure_playwright()
+
+    async def _ensure_playwright(self) -> None:
         if self._browser is not None:
             return
+        if not self.allow_playwright or self._playwright_failed:
+            raise RuntimeError("Playwright unavailable")
         from playwright.async_api import async_playwright
 
-        self._playwright = await async_playwright().start()
-        self._browser = await self._playwright.chromium.launch(headless=self.headless)
-        self._context = await self._browser.new_context(
-            user_agent=USER_AGENT,
-            locale="en-US",
-            viewport={"width": 1280, "height": 900},
-        )
-        self._context.set_default_timeout(self.timeout_ms)
+        try:
+            self._playwright = await async_playwright().start()
+            self._browser = await self._playwright.chromium.launch(headless=self.headless)
+            self._context = await self._browser.new_context(
+                user_agent=USER_AGENT,
+                locale="en-US",
+                viewport={"width": 1280, "height": 900},
+            )
+            self._context.set_default_timeout(self.timeout_ms)
+        except Exception:
+            self._playwright_failed = True
+            await self.close()
+            logger.exception("Playwright start failed")
+            raise
 
     async def close(self) -> None:
         if self._context is not None:
@@ -140,8 +163,7 @@ class UntappdClient:
     async def _get_html_playwright(
         self, url: str, *, wait_selector: Optional[str] = None
     ) -> str:
-        if self._context is None:
-            await self.start()
+        await self._ensure_playwright()
         assert self._context is not None
         page = await self._context.new_page()
         try:
@@ -161,10 +183,14 @@ class UntappdClient:
         attempts = max(1, self.max_retries + 1)
         for attempt in range(attempts):
             try:
-                if self.prefer_httpx:
+                if self.prefer_httpx or not self.allow_playwright:
                     html = await self._get_html_httpx(url)
                     if html:
                         return html
+                    if not self.allow_playwright or self._playwright_failed:
+                        raise RuntimeError(
+                            f"httpx returned no beer HTML for {url} and Playwright is unavailable"
+                        )
                     logger.info("httpx miss for %s; falling back to Playwright", url)
                 return await self._get_html_playwright(url, wait_selector=wait_selector)
             except Exception as exc:

@@ -82,9 +82,22 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         "true",
         "yes",
     }
+    prefer_httpx = os.environ.get("BEERS_CRAWLER_PREFER_HTTPX", "").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    # Default: allow Playwright. Set BEERS_CRAWLER_ALLOW_PLAYWRIGHT=0 on tiny VPS.
+    allow_pw_raw = os.environ.get("BEERS_CRAWLER_ALLOW_PLAYWRIGHT", "1").lower()
+    allow_playwright = allow_pw_raw not in {"0", "false", "no"}
     min_refresh = _min_refresh_from_env()
     db = BeerDatabase(_db_path_from_env())
-    client = UntappdClient(headless=headless)
+    client = UntappdClient(
+        headless=headless,
+        prefer_httpx=prefer_httpx,
+        allow_playwright=allow_playwright,
+    )
+    # Does not launch browser when prefer_httpx or allow_playwright=False
     await client.start()
     state.db = db
     state.client = client
@@ -93,9 +106,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         db, client, use_history=True, min_refresh_seconds=min_refresh
     )
     logger.info(
-        "API ready db=%s headless=%s min_refresh=%ss",
+        "API ready db=%s headless=%s prefer_httpx=%s allow_playwright=%s min_refresh=%ss",
         db.path,
         headless,
+        prefer_httpx,
+        allow_playwright,
         min_refresh,
     )
     try:

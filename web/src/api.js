@@ -3,11 +3,23 @@
  *  1. resolve  — beer name → Untappd page URL
  *  2. metadata — Untappd page URL → beer metadata (rating_score primary)
  *
- * In Vite dev, requests go through the proxy (same origin).
- * Override with VITE_API_BASE if the UI is served separately.
+ * Production (example.com): VITE_API_BASE=/beers/rating/api
+ * Local Vite dev: same base (proxied) or empty for bare /v1
  */
 
-const BASE = (import.meta.env.VITE_API_BASE || '').replace(/\/$/, '')
+function defaultApiBase() {
+  if (import.meta.env.VITE_API_BASE) {
+    return String(import.meta.env.VITE_API_BASE).replace(/\/$/, '')
+  }
+  // When app is served under /beers/rating/, talk to sibling /api
+  const base = import.meta.env.BASE_URL || '/'
+  if (base.includes('/beers/rating')) {
+    return '/beers/rating/api'
+  }
+  return ''
+}
+
+const BASE = defaultApiBase()
 
 async function request(path, options = {}) {
   const url = `${BASE}${path}`

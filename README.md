@@ -111,6 +111,8 @@ Optional query/body: `history_only=true`, `force=true`.
 
 Minimal SPA under [`web/`](./web) exposing **resolve** + **metadata** with a readable result card.
 
+**Production:** https://www.example.com/beers/rating/ — see [`deploy/DEPLOY.md`](./deploy/DEPLOY.md).
+
 ```bash
 # terminal 1
 uv run beers-crawler serve --port 8741
@@ -118,6 +120,9 @@ uv run beers-crawler serve --port 8741
 # terminal 2
 cd web && npm install && npm run dev
 # → http://127.0.0.1:5173
+
+# Deploy API + UI (preserves remote SQLite history)
+./scripts/deploy.sh
 ```
 
 ### Toronado Viscosity
