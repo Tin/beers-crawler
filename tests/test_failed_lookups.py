@@ -83,6 +83,23 @@ def test_normalize_alvarado_st_and_ipa_acronyms():
     ) or beer_name_search_string("Monkish Faces of Phases 3xIPA") == "faces phases"
 
 
+def test_beer_dash_brewery_order():
+    from beers_crawler.untappd.parsers import (
+        beer_name_search_string,
+        normalize_menu_query,
+        split_query_hints,
+    )
+
+    q = "Mai Tai IPA - Alvarado St."
+    norm = normalize_menu_query(q)
+    assert norm.lower().startswith("alvarado street")
+    assert "mai" in norm.lower() and "tai" in norm.lower()
+    brewery, beer = split_query_hints(q)
+    assert "alvarado" in brewery
+    assert "mai" in beer and "tai" in beer
+    assert beer_name_search_string(q) == "mai tai"
+
+
 def test_haole_punch_prefers_exact_title():
     from beers_crawler.untappd.parsers import match_score
 

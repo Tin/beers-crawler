@@ -187,6 +187,7 @@ def normalize_menu_query(query: str) -> str:
     - Expand brewery abbreviations (St. → Street)
     - Normalize IPA strength acronyms (IIPA, 3xIPA)
     - Drop trailing serving markers like (s), (S)
+    - Reorder ``Beer - Brewery`` / ``Beer | Brewery`` to ``Brewery Beer``
     """
     q = " ".join(query.split())
     if not q:
@@ -194,11 +195,15 @@ def normalize_menu_query(query: str) -> str:
     # Serving / size markers often glued by OCR: Haole Punch(s), Evangeline(S)
     q = re.sub(r"\(\s*[sS]\s*\)", " ", q)
     q = re.sub(r"\(\s*\)", " ", q)
+    # Unify dash separators (en/em dash, spaced hyphen)
+    q = re.sub(r"\s*[–—-]\s*", " - ", q)
+    q = re.sub(r"\s*[|/]\s*", " - ", q)
     for pat, repl in _BREWERY_ABBREV_PATTERNS:
         q = pat.sub(repl, q)
-    # "St." → "Street" can leave a stray period: "Street. Haole"
-    q = re.sub(r"\bStreet\.\b", "Street", q)
+    # "St." → "Street" can leave a stray period: "Street. Haole" or trailing "Street."
+    q = re.sub(r"\bStreet\.", "Street", q)
     q = re.sub(r"\s+\.", " ", q)
+    q = q.strip(" .")
     for pat, repl in _IPA_ACRONYM_PATTERNS:
         q = pat.sub(repl, q)
     # "3x ipa" / "double ipa" as trailing styles — collapse to tokens strip_style knows
@@ -207,24 +212,60 @@ def normalize_menu_query(query: str) -> str:
     q = re.sub(r"\btriple\s+ipa\b", "tipa", q, flags=re.I)
     # OCR digit/letter confusion on IPA prefix: lIPA → IPA
     q = re.sub(r"\blIPA\b", "IPA", q)
+    q = " ".join(q.split())
+    q = _maybe_reorder_beer_brewery(q)
     return " ".join(q.split())
 
 
-def strip_style_suffixes(query: str) -> str:
-    """Remove trailing style words that hurt exact-ish search engines.
+def _looks_like_brewery_phrase(text: str) -> bool:
+    """True if text is likely a brewery (known prefix or brewery keywords)."""
+    tokens = [t for t in re.split(r"[^a-z0-9]+", text.lower()) if t]
+    content = [t for t in tokens if t not in STOP_TOKENS and len(t) >= 2]
+    if not content:
+        return False
+    for prefix in KNOWN_BREWERY_PREFIXES:
+        pref = [p for p in prefix if len(p) >= 2]
+        if content[: len(pref)] == list(pref):
+            return True
+    brewery_words = {
+        "brewing",
+        "brewery",
+        "brew",
+        "company",
+        "co",
+        "street",
+        "st",
+        "works",
+        "collab",
+    }
+    if content[-1] in brewery_words or any(t in brewery_words for t in content):
+        return True
+    return False
 
-    Keeps at least two content tokens so we never collapse to a single word.
-    """
-    q = normalize_menu_query(query)
-    raw = [t for t in re.split(r"\s+", q.strip()) if t]
-    if len(raw) < 2:
-        return q.strip()
-    out = list(raw)
-    # Allow stripping down to 2 tokens (brewery + beer) or 1 beer-only name
-    min_keep = 1 if len(out) <= 2 else 2
+
+def _maybe_reorder_beer_brewery(q: str) -> str:
+    """Turn ``Mai Tai IPA - Alvarado Street`` into ``Alvarado Street Mai Tai IPA``."""
+    if " - " not in q:
+        return q
+    parts = [p.strip() for p in q.split(" - ") if p.strip()]
+    if len(parts) != 2:
+        return q
+    left, right = parts[0], parts[1]
+    left_brew = _looks_like_brewery_phrase(left)
+    right_brew = _looks_like_brewery_phrase(right)
+    # Beer - Brewery
+    if right_brew and not left_brew:
+        return f"{right} {left}"
+    # Brewery - Beer (already preferred order for split_query_hints)
+    if left_brew and not right_brew:
+        return f"{left} {right}"
+    return q
+
+
+def _strip_style_tokens_from_end(tokens: list[str], *, min_keep: int) -> list[str]:
+    out = list(tokens)
     while len(out) > min_keep:
         last = re.sub(r"[^a-z0-9]+", "", out[-1].lower())
-        # 2xipa / 3xipa / tipa / dipa / iipa
         if re.fullmatch(r"\d+x?ipa", last) or last in {"tipa", "dipa", "iipa"}:
             out.pop()
             continue
@@ -232,6 +273,20 @@ def strip_style_suffixes(query: str) -> str:
             out.pop()
             continue
         break
+    return out
+
+
+def strip_style_suffixes(query: str) -> str:
+    """Remove trailing style words that hurt exact-ish search engines.
+
+    Runs menu normalization first (abbrev expand, Beer-Brewery reorder, IPA acronyms).
+    """
+    q = " ".join(normalize_menu_query(query).split())
+    raw = [t for t in re.split(r"\s+", q.strip()) if t]
+    if len(raw) < 2:
+        return q.strip()
+    min_keep = 1 if len(raw) <= 2 else 2
+    out = _strip_style_tokens_from_end(raw, min_keep=min_keep)
     return " ".join(out)
 
 
