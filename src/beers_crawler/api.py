@@ -25,7 +25,11 @@ from beers_crawler import __version__
 from beers_crawler.auth import get_auth_config, init_auth, require_auth, reset_auth_cache
 from beers_crawler.db import BeerDatabase, default_db_path
 from beers_crawler.models import BeerMetadata, BeerPageRef, FailedLookup
-from beers_crawler.service import DEFAULT_MIN_REFRESH_SECONDS, CrawlerService
+from beers_crawler.service import (
+    DEFAULT_IOS_CACHE_SECONDS,
+    DEFAULT_MIN_REFRESH_SECONDS,
+    CrawlerService,
+)
 from beers_crawler.untappd.client import UntappdClient
 
 logger = logging.getLogger(__name__)
@@ -40,6 +44,14 @@ class CrawlRequest(BaseModel):
     )
     force: bool = Field(
         False, description="Ignore freshness window; always attempt live crawl"
+    )
+    prefer_cache: bool = Field(
+        False,
+        description=(
+            "iOS clients: if a rating exists in SQLite and is younger than "
+            "BEERS_CRAWLER_IOS_CACHE_SECONDS (default 3 days), return it immediately. "
+            "Web UI should leave this false."
+        ),
     )
 
 
@@ -74,6 +86,7 @@ class AppState:
         self.client: Optional[UntappdClient] = None
         self.service: Optional[CrawlerService] = None
         self.min_refresh_seconds: float = DEFAULT_MIN_REFRESH_SECONDS
+        self.ios_cache_seconds: float = DEFAULT_IOS_CACHE_SECONDS
 
 
 state = AppState()
@@ -92,6 +105,16 @@ def _min_refresh_from_env() -> float:
         return float(raw)
     except ValueError:
         return DEFAULT_MIN_REFRESH_SECONDS
+
+
+def _ios_cache_from_env() -> float:
+    raw = os.environ.get("BEERS_CRAWLER_IOS_CACHE_SECONDS")
+    if raw is None or raw == "":
+        return DEFAULT_IOS_CACHE_SECONDS
+    try:
+        return float(raw)
+    except ValueError:
+        return DEFAULT_IOS_CACHE_SECONDS
 
 
 @asynccontextmanager
@@ -113,6 +136,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     allow_pw_raw = os.environ.get("BEERS_CRAWLER_ALLOW_PLAYWRIGHT", "1").lower()
     allow_playwright = allow_pw_raw not in {"0", "false", "no"}
     min_refresh = _min_refresh_from_env()
+    ios_cache = _ios_cache_from_env()
     db = BeerDatabase(_db_path_from_env())
     client = UntappdClient(
         headless=headless,
@@ -123,8 +147,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     state.db = db
     state.client = client
     state.min_refresh_seconds = min_refresh
+    state.ios_cache_seconds = ios_cache
     state.service = CrawlerService(
-        db, client, use_history=True, min_refresh_seconds=min_refresh
+        db,
+        client,
+        use_history=True,
+        min_refresh_seconds=min_refresh,
+        ios_cache_seconds=ios_cache,
     )
     cfg = get_auth_config()
     logger.info(
@@ -285,9 +314,16 @@ async def export_history(
 
 @app.post("/v1/crawl", response_model=CrawlResponse)
 async def crawl(_: AuthUser, body: CrawlRequest) -> CrawlResponse:
-    """Combined: name → URL → metadata (freshness / live / history fallback)."""
+    """Combined: name → URL → metadata (freshness / live / history fallback).
+
+    Pass ``prefer_cache=true`` from the iOS app to use the longer iOS cache TTL
+    (default 3 days) when a score is already in SQLite.
+    """
     ref, meta = await _service().crawl_beer(
-        body.name, history_only=body.history_only, force=body.force
+        body.name,
+        history_only=body.history_only,
+        force=body.force,
+        prefer_cache=body.prefer_cache,
     )
     if ref is None:
         raise HTTPException(status_code=404, detail=f"no Untappd page for {body.name!r}")

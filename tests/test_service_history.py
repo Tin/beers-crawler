@@ -236,3 +236,54 @@ def test_export_csv_and_json(tmp_path):
     assert "4.5" in csv_text
     json_text = db.export_history_json()
     assert "Pliny" in json_text
+
+
+@pytest.mark.asyncio
+async def test_prefer_cache_uses_ios_ttl(tmp_path):
+    """iOS prefer_cache returns DB score within 3 days even if default min_refresh expired."""
+    from datetime import timedelta
+
+    from beers_crawler.models import utc_now
+
+    db = BeerDatabase(tmp_path / "c.db")
+    url = "https://untappd.com/b/x/1"
+    # 2 days old — older than default 6h min_refresh, younger than 3d ios cache
+    scraped = utc_now() - timedelta(days=2)
+    db.append_metadata(
+        BeerMetadata(page_url=url, name="X", rating_score=3.5, scraped_at=scraped)
+    )
+    db.save_page_ref(BeerPageRef(query="X Beer", page_url=url, match_score=1.0))
+
+    # prefer_cache first — must hit 3.5 without network
+    client_ios = FakeClient(
+        ref=BeerPageRef(query="X Beer", page_url=url, match_score=1.0),
+        meta=BeerMetadata(page_url=url, name="X", rating_score=9.9),
+    )
+    service_ios = CrawlerService(
+        db,
+        client_ios,  # type: ignore[arg-type]
+        min_refresh_seconds=6 * 3600,
+        ios_cache_seconds=3 * 24 * 3600,
+    )
+    _, meta_ios = await service_ios.crawl_beer("X Beer", prefer_cache=True)
+    assert meta_ios is not None
+    assert meta_ios.rating_score == 3.5
+    assert meta_ios.from_history is True
+    assert client_ios.resolve_calls == 0
+    assert client_ios.meta_calls == 0
+
+    # without prefer_cache → live-fetch (score 9.9) because 6h window expired
+    client_live = FakeClient(
+        ref=BeerPageRef(query="X Beer", page_url=url, match_score=1.0),
+        meta=BeerMetadata(page_url=url, name="X", rating_score=9.9),
+    )
+    service_live = CrawlerService(
+        db,
+        client_live,  # type: ignore[arg-type]
+        min_refresh_seconds=6 * 3600,
+        ios_cache_seconds=3 * 24 * 3600,
+    )
+    _, meta_live = await service_live.crawl_beer("X Beer", prefer_cache=False)
+    assert meta_live is not None
+    assert meta_live.rating_score == 9.9
+    assert client_live.meta_calls == 1

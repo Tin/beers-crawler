@@ -17,6 +17,11 @@ DEFAULT_MIN_REFRESH_SECONDS = float(
     os.environ.get("BEERS_CRAWLER_MIN_REFRESH_SECONDS", "21600")
 )
 
+# iOS-only long cache (prefer_cache=true): return DB score if younger than this.
+DEFAULT_IOS_CACHE_SECONDS = float(
+    os.environ.get("BEERS_CRAWLER_IOS_CACHE_SECONDS", str(3 * 24 * 3600))
+)
+
 
 def _as_utc(dt: datetime) -> datetime:
     if dt.tzinfo is None:
@@ -49,35 +54,43 @@ class CrawlerService:
         *,
         use_history: bool = True,
         min_refresh_seconds: float = DEFAULT_MIN_REFRESH_SECONDS,
+        ios_cache_seconds: float = DEFAULT_IOS_CACHE_SECONDS,
     ) -> None:
         self.db = db
         self.client = client
         self.use_history = use_history
         self.min_refresh_seconds = min_refresh_seconds
+        self.ios_cache_seconds = ios_cache_seconds
 
-    def _fresh_page_ref(self, beer_name: str) -> Optional[BeerPageRef]:
-        if not self.use_history or self.min_refresh_seconds <= 0:
+    def _fresh_page_ref(
+        self, beer_name: str, *, ttl_seconds: float | None = None
+    ) -> Optional[BeerPageRef]:
+        ttl = self.min_refresh_seconds if ttl_seconds is None else ttl_seconds
+        if not self.use_history or ttl <= 0:
             return None
         ref = self.db.get_page_ref(beer_name)
         if ref is None or ref.resolved_at is None:
             return None
-        if is_fresh(ref.resolved_at, self.min_refresh_seconds):
+        if is_fresh(ref.resolved_at, ttl):
             return ref.model_copy(update={"from_history": True})
         return None
 
-    def _fresh_metadata(self, page_url: str) -> Optional[BeerMetadata]:
-        if not self.use_history or self.min_refresh_seconds <= 0:
+    def _fresh_metadata(
+        self, page_url: str, *, ttl_seconds: float | None = None
+    ) -> Optional[BeerMetadata]:
+        ttl = self.min_refresh_seconds if ttl_seconds is None else ttl_seconds
+        if not self.use_history or ttl <= 0:
             return None
         cached = self.db.get_latest_metadata(page_url)
         if cached is None:
             return None
-        if is_fresh(cached.scraped_at, self.min_refresh_seconds):
+        if is_fresh(cached.scraped_at, ttl):
             logger.info(
-                "fresh history metadata for %s @ %s score=%s (min_refresh=%ss)",
+                "fresh history metadata for %s @ %s score=%s (ttl=%ss)",
                 page_url,
                 cached.scraped_at,
                 cached.rating_score,
-                self.min_refresh_seconds,
+                ttl,
             )
             return cached
         return None
@@ -285,21 +298,32 @@ class CrawlerService:
         history_only: bool = False,
         use_history: bool | None = None,
         force: bool = False,
+        prefer_cache: bool = False,
     ) -> tuple[Optional[BeerPageRef], Optional[BeerMetadata]]:
-        """Name → URL → metadata with freshness / live-first / history-fallback policy."""
+        """Name → URL → metadata with freshness / live-first / history-fallback policy.
+
+        ``prefer_cache`` (iOS clients): if a score exists in SQLite and is younger
+        than ``ios_cache_seconds`` (default 3 days), return it immediately without
+        network. Web UI should leave this false so default ``min_refresh`` applies.
+        """
         hist = self.use_history if use_history is None else use_history
+        cache_ttl = (
+            self.ios_cache_seconds if prefer_cache else self.min_refresh_seconds
+        )
 
         # Fast path: both resolve + metadata still fresh for this query
-        if hist and not force and not history_only and self.min_refresh_seconds > 0:
+        if hist and not force and not history_only and cache_ttl > 0:
             ref = self.db.get_page_ref(beer_name)
             if ref is not None:
-                meta = self._fresh_metadata(ref.page_url)
-                if meta is not None:
+                meta = self._fresh_metadata(ref.page_url, ttl_seconds=cache_ttl)
+                if meta is not None and meta.rating_score is not None:
                     logger.info(
-                        "fresh crawl hit for %r → %s score=%s",
+                        "cache hit crawl for %r → %s score=%s (prefer_cache=%s ttl=%ss)",
                         beer_name,
                         ref.page_url,
                         meta.rating_score,
+                        prefer_cache,
+                        cache_ttl,
                     )
                     return ref.model_copy(update={"from_history": True}), meta
 
