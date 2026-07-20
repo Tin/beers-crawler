@@ -51,9 +51,23 @@ def test_match_rejects_brewery_only_fieldwork():
     assert wrong <= 0.5
 
 
+def test_variants_prefer_beer_name_first():
+    from beers_crawler.untappd.parsers import beer_name_search_string
+
+    # Untappd-app style: search beer name, not brewery+name blob
+    assert beer_name_search_string("Firestone Walker Wandering Don IPA") == "wandering don"
+    assert beer_name_search_string("Moonlight Bombay by Boat") == "bombay boat"
+    vs = search_query_variants("Firestone Walker Wandering Don IPA")
+    assert vs[0].lower() == "wandering don"
+    # full brewery+name should not be the first Algolia query
+    assert "firestone" not in vs[0].lower()
+
+
 def test_variants_drop_of_for_ivander():
     vs = search_query_variants("Fieldwork Of Ivander")
-    assert any(v.lower() == "fieldwork ivander" for v in vs)
+    # beer-name first after split: ivander (fieldwork is brewery)
+    assert vs[0].lower() == "ivander"
+    assert any("fieldwork" in v.lower() for v in vs)  # full query still a fallback
 
 
 def test_record_and_list_failures(tmp_path):

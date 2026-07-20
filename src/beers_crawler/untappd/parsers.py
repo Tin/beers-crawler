@@ -162,50 +162,65 @@ def strip_style_suffixes(query: str) -> str:
     return " ".join(out)
 
 
+def _drop_stop_tokens_keep_order(text: str) -> str:
+    parts = [
+        t
+        for t in re.split(r"\s+", text.strip())
+        if re.sub(r"[^a-z0-9]+", "", t.lower()) not in STOP_TOKENS
+    ]
+    return " ".join(parts)
+
+
+def beer_name_search_string(query: str) -> Optional[str]:
+    """Beer-name portion of a free-text query for Untappd/Algolia search.
+
+    Untappd's own UX works best searching the **beer name**, then picking the hit
+    whose brewery matches — not ``\"Brewery Beer Name\"`` as one string.
+    """
+    q0 = " ".join(query.split())
+    if not q0:
+        return None
+    q0 = strip_style_suffixes(q0)
+    brewery, beer = split_query_hints(q0)
+    if beer:
+        ordered = [
+            t for t in re.split(r"[^a-z0-9]+", q0.lower()) if t in beer
+        ]
+        if ordered:
+            return " ".join(ordered)
+    # No brewery split — whole query minus stops/styles
+    cleaned = _drop_stop_tokens_keep_order(q0)
+    return cleaned or q0
+
+
 def search_query_variants(query: str) -> list[str]:
-    """Ordered unique query strings to try against search backends."""
+    """Ordered unique Algolia/query strings — **beer name first**, then fallbacks.
+
+    Order matters (Untappd-app style):
+      1. beer name only (e.g. ``Wandering Don``, ``Bombay Boat``)
+      2. beer name without internal stopwords already applied above
+      3. full query stripped of trailing styles
+      4. full original query (last resort)
+    Brewery is applied later when ranking hits, not in the primary search string.
+    """
     q0 = " ".join(query.split())
     if not q0:
         return []
-    variants: list[str] = [q0]
+
+    variants: list[str] = []
+    beer_only = beer_name_search_string(q0)
+    if beer_only:
+        variants.append(beer_only)
+        # If beer name has apostrophe-ish OCR forms, bare tokens already lowercased
+
     stripped = strip_style_suffixes(q0)
-    if stripped and stripped.lower() != q0.lower():
+    if stripped:
         variants.append(stripped)
-
-    # Drop internal stopwords (of/the/by/and) — OCR often keeps them while
-    # Untappd beer_name uses punctuation ("Ol' Ivander" vs "Of Ivander").
-    def drop_stops(s: str) -> str:
-        parts = [
-            t
-            for t in re.split(r"\s+", s)
-            if re.sub(r"[^a-z0-9]+", "", t.lower()) not in STOP_TOKENS
-        ]
-        return " ".join(parts)
-
-    for base in list(variants):
-        ds = drop_stops(base)
-        if ds and ds.lower() != base.lower():
+        ds = _drop_stop_tokens_keep_order(stripped)
+        if ds:
             variants.append(ds)
 
-    # If query looks like "Brewery Beer…", also try beer tokens alone and
-    # "Beer Brewery" reorder (helps Algolia when brewery+name order is weak).
-    brewery, beer = split_query_hints(q0)
-    if brewery and beer:
-        # preserve order of beer tokens as they appear in query
-        ordered_beer = [
-            t
-            for t in re.split(r"[^a-z0-9]+", q0.lower())
-            if t in beer
-        ]
-        ordered_brew = [
-            t
-            for t in re.split(r"[^a-z0-9]+", q0.lower())
-            if t in brewery
-        ]
-        if ordered_beer:
-            variants.append(" ".join(ordered_beer))
-        if ordered_brew and ordered_beer:
-            variants.append(" ".join(ordered_beer + ordered_brew))
+    variants.append(q0)
 
     seen: set[str] = set()
     out: list[str] = []
@@ -254,10 +269,7 @@ def split_query_hints(query: str) -> tuple[set[str], set[str]]:
     if not content:
         return set(), set(raw)
 
-    if len(content) <= 2:
-        return set(), set(content)
-
-    # Known multi-word brewery at start
+    # Known brewery prefix at start (1+ tokens) — even for short "Brewery Beer" pairs
     for prefix in KNOWN_BREWERY_PREFIXES:
         pref = [p for p in prefix if p not in STOP_TOKENS and len(p) >= 2]
         if not pref:
@@ -269,11 +281,21 @@ def split_query_hints(query: str) -> tuple[set[str], set[str]]:
             beer = {t for t in beer if t not in STOP_TOKENS} or set(content[n:])
             return brewery, beer
 
+    # Single content token — beer only
+    if len(content) == 1:
+        return set(), set(content)
+
+    # Two tokens, unknown brewery: treat as beer-only (avoid stealing name tokens)
+    # unless first token is a known single-word brewery (handled above).
+    if len(content) == 2:
+        return set(), set(content)
+
     # ≥5 content tokens: two-word brewery guess
     if len(content) >= 5:
         brewery = set(content[:2])
         beer = set(content[2:])
     else:
+        # 3–4 tokens: first token brewery, rest beer
         brewery = {content[0]}
         beer = set(content[1:])
 

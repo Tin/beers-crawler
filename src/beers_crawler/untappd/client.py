@@ -431,37 +431,38 @@ class UntappdClient:
     async def _resolve_via_algolia(self, query: str) -> list[BeerPageRef]:
         """Query Untappd's public Algolia beer index (same backend as site search UI).
 
-        Tries query variants (strip trailing IPA/style words) because Algolia often
-        returns zero hits when menus append a style not present in beer_name
-        (e.g. "Wandering Don IPA" vs beer_name "Wandering Don").
+        Strategy (mirrors Untappd app behavior):
+          1. Search primarily by **beer name** (not "Brewery + Beer" as one string).
+          2. Rank hits with our scorer so the correct **brewery** wins among namesakes.
+          3. Fall back to fuller query variants only if beer-name search is weak.
         """
         cfg = await self._fetch_untappd_search_config()
         if not cfg:
             return []
 
-        best: list[BeerPageRef] = []
+        # Merge hits across variants; re-score against full original query (brewery+beer).
+        by_url: dict[str, BeerPageRef] = {}
         for variant in search_query_variants(query):
             hits = await self._algolia_query_once(
                 cfg=cfg, query=variant, original_query=query
             )
             logger.info(
-                "Algolia variant %r → %d hits (top=%s)",
+                "Algolia beer-search %r → %d hits (top=%s)",
                 variant,
                 len(hits),
-                f"{hits[0].match_score:.2f}" if hits else "n/a",
+                f"{hits[0].match_score:.2f} {hits[0].page_url}" if hits else "n/a",
             )
-            if not hits:
-                continue
-            # Keep the variant that yields the strongest top match
-            if not best or hits[0].match_score > best[0].match_score:
-                best = hits
-            # Good enough only if beer-name tokens are present (score floor)
-            if hits[0].match_score >= 0.85:
+            for h in hits:
+                prev = by_url.get(h.page_url)
+                if prev is None or h.match_score > prev.match_score:
+                    by_url[h.page_url] = h
+            # Early exit: strong beer+brewery match already found
+            if hits and hits[0].match_score >= 0.9:
                 break
 
-        # Merge unique URLs from best list only (already best variant)
+        best = sorted(by_url.values(), key=lambda r: r.match_score, reverse=True)
         logger.info(
-            "Algolia found %d candidates for %r (top=%s)",
+            "Algolia merged %d candidates for %r (top=%s)",
             len(best),
             query,
             f"{best[0].match_score:.2f}" if best else "n/a",
