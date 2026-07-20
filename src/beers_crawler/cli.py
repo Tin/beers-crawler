@@ -49,6 +49,11 @@ def _history_options(f):
         is_flag=True,
         help="Do not read or write crawl history",
     )(f)
+    f = click.option(
+        "--force",
+        is_flag=True,
+        help="Ignore freshness window; always attempt live crawl",
+    )(f)
     return f
 
 
@@ -57,8 +62,8 @@ def _history_options(f):
 def main() -> None:
     """Untappd beer crawler CLI (SQLite history-backed).
 
-    Default policy: try live crawl first; on success append a timestamped
-    history row; on failure fall back to the latest history snapshot.
+    Default policy: return fresh history if within min-refresh window;
+    else live crawl (append on success); on failure fall back to latest history.
 
     Interfaces:
       resolve     beer name  → Untappd page URL
@@ -80,6 +85,7 @@ def resolve_cmd(
     db_path: Optional[Path],
     history_only: bool,
     no_history: bool,
+    force: bool,
     headed: bool,
     verbose: bool,
     as_json: bool,
@@ -92,6 +98,7 @@ def resolve_cmd(
             db_path,
             history_only=history_only,
             use_history=not no_history,
+            force=force,
             headless=not headed,
             as_json=as_json,
         )
@@ -105,6 +112,7 @@ async def _resolve(
     *,
     history_only: bool,
     use_history: bool,
+    force: bool,
     headless: bool,
     as_json: bool,
 ) -> int:
@@ -113,7 +121,10 @@ async def _resolve(
     service = CrawlerService(db, client, use_history=use_history)
     async with client:
         ref = await service.beer_name_to_url(
-            beer_name, history_only=history_only, use_history=use_history
+            beer_name,
+            history_only=history_only,
+            use_history=use_history,
+            force=force,
         )
     if ref is None:
         console.print(f"[red]No Untappd page found for[/red] {beer_name!r}")
@@ -141,6 +152,7 @@ def metadata_cmd(
     db_path: Optional[Path],
     history_only: bool,
     no_history: bool,
+    force: bool,
     headed: bool,
     verbose: bool,
     as_json: bool,
@@ -153,6 +165,7 @@ def metadata_cmd(
             db_path,
             history_only=history_only,
             use_history=not no_history,
+            force=force,
             headless=not headed,
             as_json=as_json,
         )
@@ -166,6 +179,7 @@ async def _metadata(
     *,
     history_only: bool,
     use_history: bool,
+    force: bool,
     headless: bool,
     as_json: bool,
 ) -> int:
@@ -174,7 +188,10 @@ async def _metadata(
     service = CrawlerService(db, client, use_history=use_history)
     async with client:
         meta = await service.url_to_metadata(
-            page_url, history_only=history_only, use_history=use_history
+            page_url,
+            history_only=history_only,
+            use_history=use_history,
+            force=force,
         )
     if meta is None:
         console.print(f"[red]Failed to fetch metadata for[/red] {page_url}")
@@ -210,6 +227,7 @@ def crawl_cmd(
     db_path: Optional[Path],
     history_only: bool,
     no_history: bool,
+    force: bool,
     headed: bool,
     verbose: bool,
     as_json: bool,
@@ -222,6 +240,7 @@ def crawl_cmd(
             db_path,
             history_only=history_only,
             use_history=not no_history,
+            force=force,
             headless=not headed,
             as_json=as_json,
         )
@@ -235,6 +254,7 @@ async def _crawl(
     *,
     history_only: bool,
     use_history: bool,
+    force: bool,
     headless: bool,
     as_json: bool,
 ) -> int:
@@ -243,7 +263,10 @@ async def _crawl(
     service = CrawlerService(db, client, use_history=use_history)
     async with client:
         ref, meta = await service.crawl_beer(
-            beer_name, history_only=history_only, use_history=use_history
+            beer_name,
+            history_only=history_only,
+            use_history=use_history,
+            force=force,
         )
     if ref is None:
         console.print(f"[red]No Untappd page found for[/red] {beer_name!r}")
@@ -280,6 +303,7 @@ async def _crawl(
     is_flag=True,
     help="Skip live crawl; read history only",
 )
+@click.option("--force", is_flag=True, help="Ignore freshness; always live crawl")
 @click.option("--headed", is_flag=True)
 @click.option("-v", "--verbose", is_flag=True)
 @click.option("--delay", default=1.5, show_default=True, help="Seconds between beers")
@@ -287,6 +311,7 @@ def batch_cmd(
     file: Path,
     db_path: Optional[Path],
     history_only: bool,
+    force: bool,
     headed: bool,
     verbose: bool,
     delay: float,
@@ -303,6 +328,7 @@ def batch_cmd(
             names,
             db_path,
             history_only=history_only,
+            force=force,
             headless=not headed,
             delay=delay,
         )
@@ -315,6 +341,7 @@ async def _batch(
     db_path: Optional[Path],
     *,
     history_only: bool,
+    force: bool,
     headless: bool,
     delay: float,
 ) -> int:
@@ -325,7 +352,9 @@ async def _batch(
     async with client:
         for i, name in enumerate(names, 1):
             console.print(f"[cyan]({i}/{len(names)})[/cyan] {name}")
-            ref, meta = await service.crawl_beer(name, history_only=history_only)
+            ref, meta = await service.crawl_beer(
+                name, history_only=history_only, force=force
+            )
             if ref and meta and meta.rating_score is not None:
                 tag = "hist" if meta.from_history else "live"
                 console.print(
@@ -436,6 +465,7 @@ def candidates_cmd(
     db_path: Optional[Path],
     history_only: bool,
     no_history: bool,
+    force: bool,
     headed: bool,
     verbose: bool,
     limit: int,
@@ -449,6 +479,7 @@ def candidates_cmd(
             db_path,
             history_only=history_only,
             use_history=not no_history,
+            force=force,
             headless=not headed,
             limit=limit,
             as_json=as_json,
@@ -463,6 +494,7 @@ async def _candidates(
     *,
     history_only: bool,
     use_history: bool,
+    force: bool,
     headless: bool,
     limit: int,
     as_json: bool,
@@ -475,6 +507,7 @@ async def _candidates(
             beer_name,
             history_only=history_only,
             use_history=use_history,
+            force=force,
             limit=limit,
         )
     if not refs:
@@ -492,6 +525,45 @@ async def _candidates(
             table.add_row(str(i), f"{r.match_score:.2f}", r.source, r.page_url)
         console.print(table)
     return 0
+
+
+@main.command("export")
+@_db_option
+@click.option(
+    "--format",
+    "fmt",
+    type=click.Choice(["csv", "json"], case_sensitive=False),
+    default="csv",
+    show_default=True,
+)
+@click.option("--url", "page_url", default=None, help="Limit to one Untappd beer URL")
+@click.option("--limit", default=None, type=int, help="Max rows (newest first)")
+@click.option(
+    "-o",
+    "--output",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Write to file (default: stdout)",
+)
+def export_cmd(
+    db_path: Optional[Path],
+    fmt: str,
+    page_url: Optional[str],
+    limit: Optional[int],
+    output: Optional[Path],
+) -> None:
+    """Export crawl history as CSV or JSON (rating time series)."""
+    db = BeerDatabase(db_path)
+    if fmt.lower() == "json":
+        text = db.export_history_json(page_url=page_url, limit=limit)
+    else:
+        text = db.export_history_csv(page_url=page_url, limit=limit)
+    if output is not None:
+        output.write_text(text)
+        console.print(f"Wrote {output} ({len(text)} bytes)")
+    else:
+        # Avoid rich wrapping for machine output
+        click.echo(text, nl=not text.endswith("\n"))
 
 
 @main.command("serve")

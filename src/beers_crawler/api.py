@@ -13,13 +13,13 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator, Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Response
 from pydantic import BaseModel, Field
 
 from beers_crawler import __version__
 from beers_crawler.db import BeerDatabase, default_db_path
 from beers_crawler.models import BeerMetadata, BeerPageRef
-from beers_crawler.service import CrawlerService
+from beers_crawler.service import DEFAULT_MIN_REFRESH_SECONDS, CrawlerService
 from beers_crawler.untappd.client import UntappdClient
 
 logger = logging.getLogger(__name__)
@@ -29,6 +29,9 @@ class CrawlRequest(BaseModel):
     name: str = Field(..., min_length=1, description="Beer name, ideally 'Brewery Beer'")
     history_only: bool = Field(
         False, description="Skip live crawl; return latest history only"
+    )
+    force: bool = Field(
+        False, description="Ignore freshness window; always attempt live crawl"
     )
 
 
@@ -41,6 +44,7 @@ class HealthResponse(BaseModel):
     status: str
     version: str
     db: str
+    min_refresh_seconds: float
     stats: dict[str, int]
 
 
@@ -49,6 +53,7 @@ class AppState:
         self.db: Optional[BeerDatabase] = None
         self.client: Optional[UntappdClient] = None
         self.service: Optional[CrawlerService] = None
+        self.min_refresh_seconds: float = DEFAULT_MIN_REFRESH_SECONDS
 
 
 state = AppState()
@@ -59,6 +64,16 @@ def _db_path_from_env() -> Path:
     return Path(raw) if raw else default_db_path()
 
 
+def _min_refresh_from_env() -> float:
+    raw = os.environ.get("BEERS_CRAWLER_MIN_REFRESH_SECONDS")
+    if raw is None or raw == "":
+        return DEFAULT_MIN_REFRESH_SECONDS
+    try:
+        return float(raw)
+    except ValueError:
+        return DEFAULT_MIN_REFRESH_SECONDS
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     headless = os.environ.get("BEERS_CRAWLER_HEADED", "").lower() not in {
@@ -66,13 +81,22 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         "true",
         "yes",
     }
+    min_refresh = _min_refresh_from_env()
     db = BeerDatabase(_db_path_from_env())
     client = UntappdClient(headless=headless)
     await client.start()
     state.db = db
     state.client = client
-    state.service = CrawlerService(db, client, use_history=True)
-    logger.info("API ready db=%s headless=%s", db.path, headless)
+    state.min_refresh_seconds = min_refresh
+    state.service = CrawlerService(
+        db, client, use_history=True, min_refresh_seconds=min_refresh
+    )
+    logger.info(
+        "API ready db=%s headless=%s min_refresh=%ss",
+        db.path,
+        headless,
+        min_refresh,
+    )
     try:
         yield
     finally:
@@ -87,7 +111,8 @@ app = FastAPI(
     version=__version__,
     description=(
         "Untappd beer resolve + metadata API. "
-        "Live crawl first; append timestamped history; fall back to history on failure."
+        "Fresh history within min_refresh window; else live crawl (append); "
+        "fall back to history on failure."
     ),
     lifespan=lifespan,
 )
@@ -107,6 +132,7 @@ async def health() -> HealthResponse:
         status="ok" if state.service else "starting",
         version=__version__,
         db=str(db.path) if db else "",
+        min_refresh_seconds=state.min_refresh_seconds,
         stats=stats,
     )
 
@@ -115,9 +141,12 @@ async def health() -> HealthResponse:
 async def resolve(
     q: str = Query(..., min_length=1, description="Beer name query"),
     history_only: bool = Query(False, description="Skip live; use history only"),
+    force: bool = Query(False, description="Ignore freshness; live crawl"),
 ) -> BeerPageRef:
-    """Interface 1: beer name → best Untappd page URL (live first)."""
-    ref = await _service().beer_name_to_url(q, history_only=history_only)
+    """Interface 1: beer name → best Untappd page URL."""
+    ref = await _service().beer_name_to_url(
+        q, history_only=history_only, force=force
+    )
     if ref is None:
         raise HTTPException(status_code=404, detail=f"no Untappd page for {q!r}")
     return ref
@@ -127,11 +156,12 @@ async def resolve(
 async def resolve_candidates(
     q: str = Query(..., min_length=1),
     history_only: bool = Query(False),
+    force: bool = Query(False),
     limit: int = Query(10, ge=1, le=50),
 ) -> list[BeerPageRef]:
     """Ranked search candidates for debugging / re-rank."""
     return await _service().beer_name_to_candidates(
-        q, history_only=history_only, limit=limit
+        q, history_only=history_only, force=force, limit=limit
     )
 
 
@@ -139,9 +169,12 @@ async def resolve_candidates(
 async def metadata(
     url: str = Query(..., min_length=8, description="Untappd /b/… page URL"),
     history_only: bool = Query(False, description="Skip live; use latest history"),
+    force: bool = Query(False, description="Ignore freshness; live crawl"),
 ) -> BeerMetadata:
-    """Interface 2: page URL → metadata. Live crawl appends history; failure → last snapshot."""
-    meta = await _service().url_to_metadata(url, history_only=history_only)
+    """Interface 2: page URL → metadata."""
+    meta = await _service().url_to_metadata(
+        url, history_only=history_only, force=force
+    )
     if meta is None:
         raise HTTPException(status_code=404, detail=f"failed to fetch metadata for {url}")
     return meta
@@ -159,11 +192,32 @@ async def metadata_history(
     return rows
 
 
+@app.get("/v1/export")
+async def export_history(
+    format: str = Query("json", pattern="^(json|csv)$"),
+    url: Optional[str] = Query(None, description="Optional Untappd beer page filter"),
+    limit: Optional[int] = Query(None, ge=1, le=10_000),
+) -> Response:
+    """Export crawl history as JSON or CSV."""
+    db = state.db
+    if db is None:
+        raise HTTPException(status_code=503, detail="db not ready")
+    if format == "csv":
+        body = db.export_history_csv(page_url=url, limit=limit)
+        return Response(
+            content=body,
+            media_type="text/csv",
+            headers={"Content-Disposition": "attachment; filename=beer_history.csv"},
+        )
+    body = db.export_history_json(page_url=url, limit=limit)
+    return Response(content=body, media_type="application/json")
+
+
 @app.post("/v1/crawl", response_model=CrawlResponse)
 async def crawl(body: CrawlRequest) -> CrawlResponse:
-    """Combined: name → URL → metadata (live first, history fallback)."""
+    """Combined: name → URL → metadata (freshness / live / history fallback)."""
     ref, meta = await _service().crawl_beer(
-        body.name, history_only=body.history_only
+        body.name, history_only=body.history_only, force=body.force
     )
     if ref is None:
         raise HTTPException(status_code=404, detail=f"no Untappd page for {body.name!r}")

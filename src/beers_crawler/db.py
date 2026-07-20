@@ -352,3 +352,75 @@ class BeerDatabase:
             "distinct_beers": distinct_beers,
             "with_rating_score": with_score,
         }
+
+    def iter_history_rows(
+        self, *, page_url: str | None = None, limit: int | None = None
+    ) -> list[BeerMetadata]:
+        """Export helper: history rows newest-first, optional filter by page_url."""
+        sql = """
+            SELECT id, page_url, name, brewery, style, abv, ibu,
+                   rating_score, rating_count, description, beer_id,
+                   scraped_at, raw_json
+            FROM beer_metadata
+        """
+        params: list[object] = []
+        if page_url:
+            sql += " WHERE page_url = ?"
+            params.append(page_url)
+        sql += " ORDER BY scraped_at DESC, id DESC"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(limit)
+        with self.connection() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [self._row_to_metadata(r, from_history=True) for r in rows]
+
+    def export_history_json(
+        self, *, page_url: str | None = None, limit: int | None = None
+    ) -> str:
+        import json
+
+        rows = self.iter_history_rows(page_url=page_url, limit=limit)
+        return json.dumps([r.model_dump(mode="json") for r in rows], indent=2)
+
+    def export_history_csv(
+        self, *, page_url: str | None = None, limit: int | None = None
+    ) -> str:
+        import csv
+        import io
+
+        rows = self.iter_history_rows(page_url=page_url, limit=limit)
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(
+            [
+                "history_id",
+                "scraped_at",
+                "page_url",
+                "name",
+                "brewery",
+                "style",
+                "rating_score",
+                "rating_count",
+                "abv",
+                "ibu",
+                "beer_id",
+            ]
+        )
+        for m in rows:
+            writer.writerow(
+                [
+                    m.history_id,
+                    m.scraped_at.isoformat() if m.scraped_at else "",
+                    m.page_url,
+                    m.name or "",
+                    m.brewery or "",
+                    m.style or "",
+                    m.rating_score if m.rating_score is not None else "",
+                    m.rating_count if m.rating_count is not None else "",
+                    m.abv if m.abv is not None else "",
+                    m.ibu if m.ibu is not None else "",
+                    m.beer_id or "",
+                ]
+            )
+        return buf.getvalue()

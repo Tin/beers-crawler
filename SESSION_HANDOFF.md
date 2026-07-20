@@ -1,107 +1,84 @@
-# Session handoff — 2026-07-19 (evening)
+# Session handoff — 2026-07-19 (late)
 
 **Next agent: start here, then read [`PLAN.md`](./PLAN.md).**
 
 ---
 
-## What happened this session
+## What landed
 
-Built on green P0 live crawl:
+### beers-crawler (`main`)
 
-### History storage (user request)
+| Feature | Status |
+|---------|--------|
+| Live Untappd crawl (P0) | done |
+| List-vs-sidebar ranking (P1) | done |
+| Append-only rating history | done |
+| **Min refresh window (default 6h)** | done — `BEERS_CRAWLER_MIN_REFRESH_SECONDS` |
+| **`--force` / API `force`** | done |
+| **`export` CSV/JSON** | done CLI + `GET /v1/export` |
+| FastAPI `serve` | done |
+| Offline tests | **22 passed** + CI |
 
-Ratings drift → **append-only** crawl history, not overwrite cache.
+### Toronado Viscosity (`main` — commit this session)
 
-| Policy | Behavior |
-|--------|----------|
-| Live OK | Return fresh data; **append** `beer_metadata` row with `scraped_at` |
-| Live fails | Fall back to **latest** history (`from_history=true`) |
-| `--history-only` / `history_only=true` | No network |
-
-Verified live: two Pliny crawls → history ids 1 and 2; `--history-only` returns latest.
-
-### P1 harden resolution
-
-- Prefer `div.beer-item` / `div.results-container` over sidebar featured brands
-- Stronger brewery + beer token scoring (toronado-style)
-- Mega-brand penalty expanded
-- Store **all** search candidates in `beer_pages`
-- Compact fixture: `tests/fixtures/search_pliny_compact.html`
-
-### P3 FastAPI stub
-
-```text
-uv run beers-crawler serve --port 8741
-GET  /v1/resolve?q=
-GET  /v1/resolve/candidates?q=
-GET  /v1/metadata?url=
-GET  /v1/metadata/history?url=
-POST /v1/crawl  { "name": "…" }
-GET  /v1/list
-GET  /health
-```
-
-### Tests / CI
-
-- `uv run pytest -q` → **18 passed**
-- `.github/workflows/ci.yml` (offline pytest only)
+| Feature | Status |
+|---------|--------|
+| `BeersCrawlerClient` + `BeersCrawlerRatingLookup` | done |
+| App default lookup → crawler HTTP (fallback search links) | done |
+| Specs | `DescribeBeersCrawlerClientSpec` green |
+| Timeout | `TimedBeerRatingLookup` 45s for server crawl |
 
 ---
 
-## Where to continue
+## How it fits together
 
-1. **Toronado HTTP client** — point app at `beers-crawler serve` instead of in-app scrape
-2. **P2 ops** — export CSV/JSON of history, retry polish, config file/env docs
-3. Optional: rate-limit / min-interval so re-crawls don’t hammer Untappd every request
-4. Optional: chart rating over time from `history` rows
+```text
+iOS MenuScanViewModel
+  TimedBeerRatingLookup(45s)
+    BeersCrawlerRatingLookup  ──POST /v1/crawl──►  beers-crawler serve :8741
+      fallback: SearchLinkBeerRatingLookup              │
+                                                   CrawlerService
+                                                   fresh history? → return
+                                                   else live Playwright
+                                                   append history / fallback
+```
+
+Local Simulator: crawler on Mac `127.0.0.1:8741` works if app runs in Simulator (shares host net).  
+Physical device: `BEERS_CRAWLER_URL=http://<mac-lan-ip>:8741` + `serve --host 0.0.0.0`.
 
 ---
 
 ## Bootstrap
 
 ```bash
+# crawler
 cd /path/to/beers-crawler
-uv sync
-uv run playwright install chromium   # if needed
+uv sync && uv run playwright install chromium
 uv run pytest -q
-uv run beers-crawler crawl "Russian River Pliny the Elder" -v
-uv run beers-crawler history "https://untappd.com/b/russian-river-brewing-company-pliny-the-elder/4499"
-uv run beers-crawler serve
-```
+uv run beers-crawler serve --host 0.0.0.0 --port 8741
 
-**Contracts (stable):**
-
-1. `beer name: str` → Untappd page URL
-2. `untappd page URL` → metadata / **`rating_score`** (+ history)
-
-**New model flags:** `from_history`, `history_id`, `scraped_at` on snapshots.
-
----
-
-## Architecture
-
-```text
-CLI / FastAPI
-       │
-CrawlerService   live-first → append history → fallback
-       │
-UntappdClient (Playwright; optional httpx)
-       │
-parsers.py
-       │
-SQLite  beer_pages (candidates upsert)
-        beer_metadata (append-only history)
+# app core specs
+cd /path/to/toronado-viscosity
+swift run ToronadoCoreSpecs
 ```
 
 ---
 
-## Session checklist
+## Next ideas
 
-```text
-[x] P1 harden parsers (list vs sidebar)
-[x] Append-only rating history + live-first fallback
-[x] FastAPI stub + serve CLI
-[x] pytest 18 green + CI workflow
-[ ] Commit + push this slice
-[ ] Toronado HTTP client wiring
-```
+1. End-to-end: serve crawler + Simulator scan → confirm scores from API
+2. Min-refresh tuning / per-beer stale UI in app
+3. History chart in app or simple web UI (P4)
+4. Auth / bind to LAN only if exposed beyond localhost
+
+---
+
+## Key files
+
+| Area | Path |
+|------|------|
+| Freshness + crawl policy | `beers-crawler/src/beers_crawler/service.py` |
+| History export | `beers-crawler/src/beers_crawler/db.py` (`export_history_*`) |
+| API | `beers-crawler/src/beers_crawler/api.py` |
+| iOS client | `toronado-viscosity/Sources/ToronadoCore/BeersCrawlerClient.swift` |
+| App wiring | `toronado-viscosity/App/ToronadoViscosity/MenuScanViewModel.swift` |

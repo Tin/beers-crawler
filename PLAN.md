@@ -134,16 +134,17 @@ uv run beers-crawler serve --port 8741
 
 ### P2 — CLI / ops polish
 
-1. Export CSV/JSON of history time series
-2. Stronger retry/backoff on 429/timeout; min re-crawl interval
-3. Config file (YAML/env): DB path, delay, headless, user-agent
+1. ~~Export CSV/JSON of history time series~~ **done** (`export` + `/v1/export`)
+2. ~~Min re-crawl interval~~ **done** (`min_refresh_seconds` default 6h, `--force`)
+3. Config file (YAML/env): DB path, delay, headless, user-agent — partial (env vars exist)
 4. ~~GitHub Actions offline pytest~~ **done**
+5. Stronger retry/backoff on 429/timeout — basic retries exist; can harden
 
 ### P3 — Service API
 
 1. ~~FastAPI stub + `beers-crawler serve`~~ **done**
 2. Same `CrawlerService` underneath
-3. **Next:** Toronado Viscosity HTTP client → this service
+3. ~~Toronado Viscosity HTTP client → this service~~ **done** (`BeersCrawlerRatingLookup`)
 
 ### P4 — Web UI (later)
 
@@ -208,8 +209,17 @@ beer_metadata(
 - [x] Live failure falls back to latest history (unit-tested)
 - [x] Primary-list vs sidebar ranking (fixture + unit tests)
 - [x] FastAPI `/v1/*` + `beers-crawler serve`
-- [x] `pytest` 18 offline; CI workflow
-- [ ] Toronado client wired to API
+- [x] `pytest` offline; CI workflow
+- [x] Toronado client wired to API
+
+## Success criteria (v0.4) — freshness + export + iOS
+
+- [x] Min refresh window skips live when snapshot is fresh
+- [x] `--force` / `force=true` bypasses freshness
+- [x] `export` CSV/JSON + `/v1/export`
+- [x] `BeersCrawlerRatingLookup` default in MenuScanViewModel
+- [x] ToronadoCoreSpecs green including crawler client specs
+- [ ] E2E Simulator scan against live `serve`
 
 ### Live results snapshot (2026-07-19)
 
@@ -234,10 +244,8 @@ beer_metadata(
 ## Session checklist (copy for next agent)
 
 ```text
-[x] P0 live crawl
-[x] P1 harden + history policy + FastAPI
-[x] pytest offline + CI
-[ ] Commit/push v0.3 slice
-[ ] Toronado HTTP client → beers-crawler serve
-[ ] Optional: min re-crawl interval / history export
+[x] P0–P3 + history + freshness + export + Toronado client
+[ ] Commit/push both repos
+[ ] E2E: serve crawler + Simulator rating lookup
+[ ] Optional: config file, history chart UI
 ```

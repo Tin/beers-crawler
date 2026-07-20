@@ -19,15 +19,19 @@ https://untappd.com/b/.../4499
 { name, brewery, rating_score, rating_count, scraped_at, ... }
 ```
 
-### History policy
+### History + freshness policy
 
 Ratings drift over time. Every successful metadata crawl **appends** a timestamped row — nothing is overwritten.
 
 | Situation | Behavior |
 |-----------|----------|
+| Snapshot younger than `min_refresh` (default **6h**) | Return history; **skip** live crawl |
 | Live crawl OK | Return fresh data; **append** history snapshot |
 | Live crawl fails | Return **latest** history snapshot if one exists (`from_history=true`) |
 | `--history-only` | Skip network; read latest history only |
+| `--force` | Ignore freshness; always attempt live crawl |
+
+Env: `BEERS_CRAWLER_MIN_REFRESH_SECONDS` (default `21600`), `BEERS_CRAWLER_DB`, `BEERS_CRAWLER_HEADED=1`.
 
 ## Setup
 
@@ -55,8 +59,15 @@ uv run beers-crawler crawl "Russian River Pliny the Elder" -v
 # Past snapshots for one beer
 uv run beers-crawler history "https://untappd.com/b/russian-river-brewing-company-pliny-the-elder/4499"
 
+# Export rating time series
+uv run beers-crawler export --format csv -o history.csv
+uv run beers-crawler export --format json --url "https://untappd.com/b/.../4499"
+
 # Offline read of last known score
 uv run beers-crawler crawl "Russian River Pliny the Elder" --history-only
+
+# Force live re-crawl (ignore 6h freshness)
+uv run beers-crawler crawl "Russian River Pliny the Elder" --force
 
 # Batch (each success appends a history row)
 uv run beers-crawler batch beers.example.txt --delay 2
@@ -75,6 +86,7 @@ Flags:
 
 - `--db PATH` — SQLite file (default `./data/beers.db`)
 - `--history-only` — skip live crawl; read history only
+- `--force` — ignore freshness window; always live crawl
 - `--no-history` — do not read/write SQLite history
 - `--headed` — show the browser
 - `--json` — machine-readable output
@@ -84,15 +96,25 @@ Flags:
 
 | Method | Path | Notes |
 |--------|------|--------|
-| `GET` | `/health` | liveness + DB stats |
+| `GET` | `/health` | liveness + DB stats + min_refresh |
 | `GET` | `/v1/resolve?q=` | name → URL |
 | `GET` | `/v1/resolve/candidates?q=` | ranked candidates |
-| `GET` | `/v1/metadata?url=` | URL → metadata (live + append) |
+| `GET` | `/v1/metadata?url=` | URL → metadata (fresh / live + append) |
 | `GET` | `/v1/metadata/history?url=` | all snapshots |
-| `POST` | `/v1/crawl` | `{ "name": "…" }` |
+| `GET` | `/v1/export?format=csv\|json` | full history export |
+| `POST` | `/v1/crawl` | `{ "name": "…", "force": false }` |
 | `GET` | `/v1/list` | latest snapshot per beer |
 
-Optional query/body: `history_only=true`.
+Optional query/body: `history_only=true`, `force=true`.
+
+### Toronado Viscosity
+
+App uses `BeersCrawlerRatingLookup` → `POST /v1/crawl`. Run the service locally (Simulator → host):
+
+```bash
+uv run beers-crawler serve --host 0.0.0.0 --port 8741
+# optional: BEERS_CRAWLER_URL=http://<mac-lan-ip>:8741
+```
 
 ## Project layout
 
