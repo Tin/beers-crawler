@@ -83,6 +83,34 @@ def test_normalize_alvarado_st_and_ipa_acronyms():
     ) or beer_name_search_string("Monkish Faces of Phases 3xIPA") == "faces phases"
 
 
+def test_year_shorthand_and_apa_and_trailing_brewery():
+    from beers_crawler.untappd.parsers import (
+        beer_name_search_string,
+        normalize_menu_query,
+        search_query_variants,
+        split_query_hints,
+        strip_style_suffixes,
+    )
+
+    q = "Life '22 - Barreled Souls"
+    assert "2022" in normalize_menu_query(q)
+    assert beer_name_search_string(q) == "life 2022"
+    vs = search_query_variants(q)
+    assert "life 2022" in [v.lower() for v in vs]
+    assert "life" in [v.lower() for v in vs]
+    assert "2022" in normalize_menu_query("Life 22' - Barreled Souls")
+
+    q2 = "Humm Baby APA Altamont"
+    norm = normalize_menu_query(q2)
+    assert norm.lower().startswith("altamont")
+    assert "apa" not in beer_name_search_string(q2).split()
+    brewery, beer = split_query_hints(q2)
+    assert "altamont" in brewery
+    assert "humm" in beer and "baby" in beer
+    assert "apa" not in beer
+    assert strip_style_suffixes("Altamont Humm Baby APA").lower().endswith("baby")
+
+
 def test_beer_dash_brewery_order():
     from beers_crawler.untappd.parsers import (
         beer_name_search_string,

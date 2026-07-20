@@ -72,6 +72,7 @@ STYLE_SUFFIX_TOKENS = frozenset(
         "dipa",
         "iipa",  # double IPA acronym (also normalized from IIPA)
         "tipa",  # triple IPA
+        "apa",  # American Pale Ale — strip like IPA
         "ddh",
         "neipa",
         "hazy",
@@ -185,9 +186,10 @@ def normalize_menu_query(query: str) -> str:
     """Clean OCR/menu noise before split/search.
 
     - Expand brewery abbreviations (St. → Street)
-    - Normalize IPA strength acronyms (IIPA, 3xIPA)
+    - Expand vintage shorthand (Life '22 → Life 2022)
+    - Normalize IPA/APA strength acronyms (IIPA, 3xIPA, APA)
     - Drop trailing serving markers like (s), (S)
-    - Reorder ``Beer - Brewery`` / ``Beer | Brewery`` to ``Brewery Beer``
+    - Reorder ``Beer - Brewery`` / ``Beer Brewery`` to ``Brewery Beer``
     """
     q = " ".join(query.split())
     if not q:
@@ -198,6 +200,25 @@ def normalize_menu_query(query: str) -> str:
     # Unify dash separators (en/em dash, spaced hyphen)
     q = re.sub(r"\s*[–—-]\s*", " - ", q)
     q = re.sub(r"\s*[|/]\s*", " - ", q)
+    # Vintage shorthand: Life '22 / Life ’22 → Life 2022
+    # Prefer 20xx for two-digit years 00–39, 19xx for 40–99.
+    def _expand_year_token(yy_s: str) -> str:
+        yy = int(yy_s)
+        century = 2000 if yy <= 39 else 1900
+        return str(century + yy)
+
+    # '22 or ’22 or 22' (OCR sometimes puts apostrophe after the digits)
+    q = re.sub(
+        r"['’`](\d{2})\b",
+        lambda m: _expand_year_token(m.group(1)),
+        q,
+    )
+    # 22' / 22’ — apostrophe is not a word char, so no \b after it
+    q = re.sub(
+        r"\b(\d{2})['’`](?!\d)",
+        lambda m: _expand_year_token(m.group(1)),
+        q,
+    )
     for pat, repl in _BREWERY_ABBREV_PATTERNS:
         q = pat.sub(repl, q)
     # "St." → "Street" can leave a stray period: "Street. Haole" or trailing "Street."
@@ -212,8 +233,11 @@ def normalize_menu_query(query: str) -> str:
     q = re.sub(r"\btriple\s+ipa\b", "tipa", q, flags=re.I)
     # OCR digit/letter confusion on IPA prefix: lIPA → IPA
     q = re.sub(r"\blIPA\b", "IPA", q)
+    # APA as style token (American Pale Ale) — leave word for strip_style_suffixes
+    q = re.sub(r"\bAPA\b", "apa", q)
     q = " ".join(q.split())
     q = _maybe_reorder_beer_brewery(q)
+    q = _maybe_move_trailing_brewery(q)
     return " ".join(q.split())
 
 
@@ -259,6 +283,34 @@ def _maybe_reorder_beer_brewery(q: str) -> str:
     # Brewery - Beer (already preferred order for split_query_hints)
     if left_brew and not right_brew:
         return f"{left} {right}"
+    return q
+
+
+def _maybe_move_trailing_brewery(q: str) -> str:
+    """Reorder ``Humm Baby APA Altamont`` → ``Altamont Humm Baby APA`` when the
+    last 1–2 tokens match a known brewery prefix and the front does not.
+    """
+    tokens = [t for t in re.split(r"\s+", q) if t]
+    if len(tokens) < 3:
+        return q
+    content = [
+        re.sub(r"[^a-z0-9]+", "", t.lower())
+        for t in tokens
+        if re.sub(r"[^a-z0-9]+", "", t.lower())
+    ]
+    # Try last 2 tokens, then last 1, as brewery
+    for n in (2, 1):
+        if len(content) <= n:
+            continue
+        tail = content[-n:]
+        head = content[:-n]
+        for prefix in KNOWN_BREWERY_PREFIXES:
+            pref = [p for p in prefix if len(p) >= 2]
+            if list(pref) == tail and head and not _looks_like_brewery_phrase(
+                " ".join(tokens[:-n])
+            ):
+                # Move matching surface tokens to front
+                return " ".join(tokens[-n:] + tokens[:-n])
     return q
 
 
@@ -317,13 +369,19 @@ def beer_name_search_string(query: str) -> Optional[str]:
     return cleaned or q0
 
 
+def _vintage_year_in_text(text: str) -> Optional[str]:
+    m = re.search(r"\b(19\d{2}|20\d{2})\b", text)
+    return m.group(1) if m else None
+
+
 def search_query_variants(query: str) -> list[str]:
     """Ordered unique Algolia/query strings — **beer name first**, then fallbacks.
 
     Order matters (Untappd-app style):
-      1. beer name only (e.g. ``Wandering Don``, ``Haole Punch``)
-      2. full query stripped of trailing styles / expanded abbreviations
-      3. original query (last resort)
+      1. beer name only (e.g. ``Wandering Don``, ``Haole Punch``, ``Life 2022``)
+      2. beer name without year (``Life``) as secondary
+      3. full query stripped of trailing styles / expanded abbreviations
+      4. original query (last resort)
     Brewery is applied later when ranking hits, not in the primary search string.
     """
     original = " ".join(query.split())
@@ -335,6 +393,16 @@ def search_query_variants(query: str) -> list[str]:
     beer_only = beer_name_search_string(normalized)
     if beer_only:
         variants.append(beer_only)
+        # Also try beer name without a trailing/embedded vintage year
+        year = _vintage_year_in_text(beer_only)
+        if year:
+            without_year = " ".join(
+                t
+                for t in beer_only.split()
+                if t != year
+            ).strip()
+            if without_year:
+                variants.append(without_year)
 
     stripped = strip_style_suffixes(normalized)
     if stripped:
@@ -504,6 +572,12 @@ def match_score(query: str, slug: str, link_text: str = "", *, in_primary_list: 
         beer_phrase = "-".join(ordered)
         if beer_phrase and len(beer_phrase) >= 4 and beer_phrase in slug_l:
             bonus += 0.1
+
+    # Vintage year in query should appear in slug/title when present
+    year_tokens = {t for t in q if re.fullmatch(r"(19|20)\d{2}", t)}
+    if year_tokens and not (year_tokens & s):
+        # Query asks for a vintage year that isn't on this candidate
+        bonus -= 0.15
 
     # Prefer exact beer_name over longer variants (Haole Punch vs Haole Punch Vanilla)
     exact_title = False
