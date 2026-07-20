@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import AsyncIterator, Optional
 
 from fastapi import FastAPI, HTTPException, Query, Response
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from beers_crawler import __version__
@@ -115,6 +116,19 @@ app = FastAPI(
         "fall back to history on failure."
     ),
     lifespan=lifespan,
+)
+
+# Vite dev server (web/) and common local origins
+_cors = os.environ.get(
+    "BEERS_CRAWLER_CORS",
+    "http://127.0.0.1:5173,http://localhost:5173,http://127.0.0.1:4173,http://localhost:4173",
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[o.strip() for o in _cors.split(",") if o.strip()] or ["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 

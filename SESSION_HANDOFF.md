@@ -64,11 +64,22 @@ swift run ToronadoCoreSpecs
 
 ---
 
+## Web UI
+
+Vite + Vue SPA in `web/`:
+
+```bash
+uv run beers-crawler serve --port 8741
+cd web && npm run dev   # http://127.0.0.1:5173
+```
+
+Proxies `/v1` + `/health`. CORS enabled on API for `:5173`.
+
 ## Next ideas
 
 1. End-to-end: serve crawler + Simulator scan → confirm scores from API
 2. Min-refresh tuning / per-beer stale UI in app
-3. History chart in app or simple web UI (P4)
+3. History chart in web UI
 4. Auth / bind to LAN only if exposed beyond localhost
 
 ---

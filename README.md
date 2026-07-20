@@ -107,6 +107,19 @@ Flags:
 
 Optional query/body: `history_only=true`, `force=true`.
 
+### Web UI (Vite + Vue)
+
+Minimal SPA under [`web/`](./web) exposing **resolve** + **metadata** with a readable result card.
+
+```bash
+# terminal 1
+uv run beers-crawler serve --port 8741
+
+# terminal 2
+cd web && npm install && npm run dev
+# → http://127.0.0.1:5173
+```
+
 ### Toronado Viscosity
 
 App uses `BeersCrawlerRatingLookup` → `POST /v1/crawl`. Run the service locally (Simulator → host):
